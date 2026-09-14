@@ -1,0 +1,43 @@
+[Unit]
+Description=Reuters Google News RSS Crawler
+Documentation=file:///opt/reuters-crawler/README.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=www-data
+Group=www-data
+WorkingDirectory=/opt/reuters-crawler
+
+# 虚拟环境（按实际路径调整）
+Environment="PATH=/opt/reuters-crawler/venv/bin:/usr/local/bin:/usr/bin:/bin"
+Environment="PYTHONUNBUFFERED=1"
+
+# 程序自行读取 .env，这里无需 EnvironmentFile；
+# 若改为系统级环境注入，可取消下行注释并在 .env 中移除对应项
+# EnvironmentFile=/opt/reuters-crawler/.env
+
+# 必须经 xvfb 启动：nodriver 通道需要「有头」浏览器——DataDome 能识别 headless 模式，
+# headless=True 实测必被拦。xvfb 提供虚拟显示，使无显示器服务器也能跑有头 Chrome。
+# 安装：sudo apt install -y xvfb
+ExecStart=/usr/bin/xvfb-run -a /opt/reuters-crawler/venv/bin/python /opt/reuters-crawler/main.py
+
+# 崩溃/异常退出后自动拉起
+Restart=always
+RestartSec=10
+# 启动节流：60 秒内最多重启 5 次，防止数据库故障时出现重启风暴
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+# 日志：程序写 logs/crawler.log，同时输出 journal
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=reuters-crawler
+
+# 安全加固（按需调整）
+NoNewPrivileges=true
+PrivateTmp=true
+
+[Install]
+WantedBy=multi-user.target

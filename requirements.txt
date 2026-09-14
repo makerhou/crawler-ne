@@ -1,0 +1,32 @@
+# Reuters 爬虫（Google News RSS）依赖
+# 安装：python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
+
+# Google News 链接解码（核心）
+googlenewsdecoder>=0.1.7
+
+# RSS 解析
+feedparser>=6.0.10
+
+# 正文 / 作者 / 发布时间抽取
+trafilatura>=1.12.0
+
+# HTTP 请求
+requests>=2.31.0
+
+# 反爬增强：模拟真实浏览器 TLS/JA3 指纹（过 Cloudflare 的关键）
+curl_cffi>=0.7.0
+
+# 反检测浏览器（纯 CDP，无 webdriver 痕迹）——突破 DataDome / CloudFront JS 挑战
+# ⚠️ 需要 Python 3.10+（3.9 会因语法不兼容无法导入；本项目已做延迟导入，
+#    低版本环境下该通道自动跳过，不影响其余功能）
+nodriver>=0.48.0
+
+# 数据库：走 CloudBase OpenAPI（HTTP），不再需要 MySQL 直连驱动
+# （原 PyMySQL 已移除，避免误以为仍支持直连）
+
+# headless 浏览器（绕过 JS 渲染 / 反爬兜底）
+# 安装后还需下载浏览器内核：
+#   playwright install chromium
+# Debian/Ubuntu 缺系统依赖时：
+#   playwright install-deps chromium
+playwright>=1.40.0
