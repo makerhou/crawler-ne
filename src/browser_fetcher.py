@@ -76,21 +76,35 @@ class BrowserFetcher:
 
     # ---------- 生命周期 ----------
     def _ensure_context(self) -> Any:
+        """启动（或复用）浏览器上下文；启动失败返回 None 并永久禁用该通道。
+
+        浏览器内核缺失（未执行 `playwright install chromium`）时，若不禁用，
+        每篇文章都会重试启动一次并打一条 WARNING，20 篇就是 20 条噪音。
+        """
         if self._context is not None:
             return self._context
 
         from playwright.sync_api import sync_playwright
 
-        self._pw = sync_playwright().start()
-        launch_kwargs: dict[str, Any] = {"headless": self.headless, "args": _LAUNCH_ARGS}
-        if self.proxy:
-            launch_kwargs["proxy"] = {"server": self.proxy}
-        self._browser = self._pw.chromium.launch(**launch_kwargs)
+        try:
+            self._pw = sync_playwright().start()
+            launch_kwargs: dict[str, Any] = {"headless": self.headless, "args": _LAUNCH_ARGS}
+            if self.proxy:
+                launch_kwargs["proxy"] = {"server": self.proxy}
+            self._browser = self._pw.chromium.launch(**launch_kwargs)
 
-        context_kwargs: dict[str, Any] = {}
-        if self.user_agent:
-            context_kwargs["user_agent"] = self.user_agent
-        self._context = self._browser.new_context(**context_kwargs)
+            context_kwargs: dict[str, Any] = {}
+            if self.user_agent:
+                context_kwargs["user_agent"] = self.user_agent
+            self._context = self._browser.new_context(**context_kwargs)
+        except Exception as exc:
+            self._safe_close()
+            self._available = False
+            logger.error(
+                "浏览器启动失败，已禁用该通道（内核缺失请执行 playwright install chromium）: %s",
+                exc,
+            )
+            return None
 
         self._apply_stealth()
         logger.info("headless 浏览器已启动（headless=%s, stealth=%s）", self.headless, self._stealth_ok)
@@ -126,6 +140,8 @@ class BrowserFetcher:
 
         try:
             context = self._ensure_context()
+            if context is None:
+                return None
             page = context.new_page()
             try:
                 page.goto(url, timeout=self.timeout_ms, wait_until="domcontentloaded")

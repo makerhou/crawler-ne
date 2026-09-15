@@ -14,7 +14,9 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import random
 import time
+from pathlib import Path
 
 from .user_agents import UserAgentPool
 
@@ -67,6 +69,8 @@ class NodriverFetcher:
         wait_seconds: float = 8.0,
         max_switch: int = 3,
         request_interval: float = 5.0,
+        dump_dir: str = "",
+        fail_fast_threshold: int = 0,
     ) -> None:
         self.ua_pool = ua_pool or UserAgentPool()
         self.proxies = proxies
@@ -75,6 +79,12 @@ class NodriverFetcher:
         self.max_switch = max(1, max_switch)
         # 每次抓取后的冷却：实测密集请求会让 IP 被 DataDome 快速拉黑
         self.request_interval = max(0.0, request_interval)
+        # 被判定拦截时的 HTML 落盘目录（空串 = 不落盘）
+        self.dump_dir = dump_dir
+        # 连续多少篇全被拦后熔断本轮（0 = 不熔断）
+        self.fail_fast_threshold = max(0, fail_fast_threshold)
+        self._consecutive_failures = 0
+        self._tripped = False
         self._last_profile_name: str = ""
 
     @property
@@ -195,8 +205,17 @@ class NodriverFetcher:
         return loop.run_until_complete(coro_factory())
 
     def get_html(self, url: str) -> str | None:
-        """同步抓取；检测到拦截则自动换身份重试，全部失败返回 None。"""
+        """同步抓取；检测到拦截则自动换身份重试，全部失败返回 None。
+
+        熔断（`fail_fast_threshold > 0`）：连续 N 篇文章「换满身份仍被拦」时，
+        判定为 IP 层封禁（此时换 UA 是无效功），本轮剩余文章直接跳过该通道。
+        计数按「文章」计，同一篇内的多次身份切换只算 1 次失败。
+        """
         if not url:
+            return None
+
+        if self._tripped:
+            logger.debug("nodriver 已熔断，跳过该通道 | url=%s", url[:80])
             return None
 
         for attempt in range(1, self.max_switch + 1):
@@ -227,8 +246,10 @@ class NodriverFetcher:
                     profile["name"],
                     len(html),
                 )
+                self._consecutive_failures = 0
                 return html
 
+            self._dump_blocked(html, profile, url)
             logger.warning(
                 "第 %d/%d 次被反爬拦截（身份=%s，%d 字节）→ 切换身份重试",
                 attempt,
@@ -238,4 +259,56 @@ class NodriverFetcher:
             )
 
         logger.error("nodriver 已切换 %d 次身份仍被拦截: %s", self.max_switch, url[:100])
+        self._register_failure()
         return None
+
+    # ---------- 熔断 ----------
+    def _register_failure(self) -> None:
+        """记录一次「整篇失败」并按需熔断。"""
+        self._consecutive_failures += 1
+        if not self.fail_fast_threshold:
+            return
+        if self._consecutive_failures < self.fail_fast_threshold:
+            return
+
+        self._tripped = True
+        logger.warning(
+            "nodriver 连续 %d 篇被拦，判定为 IP 层封禁（换身份无效）→ 本轮剩余文章跳过该通道。"
+            "如需恢复请换出口 IP 或配置代理",
+            self._consecutive_failures,
+        )
+
+    def reset(self) -> None:
+        """解除熔断并清零计数（新一轮开始时调用）。"""
+        self._consecutive_failures = 0
+        self._tripped = False
+
+    @property
+    def tripped(self) -> bool:
+        """是否已熔断（供上层观测）。"""
+        return self._tripped
+
+    # ---------- 诊断 ----------
+    def _dump_blocked(self, html: str, profile: dict[str, str], url: str) -> None:
+        """把被判定为拦截页的 HTML 落盘，便于定位挑战页类型。
+
+        文件名含时间/身份/字节数，便于对比不同身份的响应差异。
+        落盘失败（目录不可写等）只记 debug，不影响主流程。
+        """
+        if not self.dump_dir:
+            return
+
+        try:
+            directory = Path(self.dump_dir)
+            directory.mkdir(parents=True, exist_ok=True)
+            stamp = time.strftime("%Y%m%d-%H%M%S")
+            name = f"{stamp}_{profile['name']}_{len(html)}B_{random.randint(1000, 9999)}.html"
+            target = directory / name
+            target.write_text(
+                f"<!-- url={url} -->\n{html}",
+                encoding="utf-8",
+                errors="replace",
+            )
+            logger.info("已保存拦截页样本: %s", target)
+        except Exception as exc:  # 诊断功能不得影响抓取主流程
+            logger.debug("保存拦截页样本失败（忽略）: %s", exc)

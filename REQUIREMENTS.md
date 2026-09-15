@@ -114,6 +114,12 @@ ON DUPLICATE KEY UPDATE update_time = VALUES(update_time);
 | `BROWSER_WAIT_SELECTOR` | 空 | 纯 JS 渲染页可填选择器（如 `article`） |
 | `BROWSER_WAIT_MS` | `1000` | 未配选择器时的固定等待毫秒 |
 | `HTTP_PROXY` / `HTTPS_PROXY` | 空 | 可选代理（海外部署通常不需要） |
+| `NODRIVER_HEADLESS` | `false` | DataDome 能识别 headless，必须非 headless（服务器用 `xvfb-run`） |
+| `NODRIVER_WAIT_SECONDS` | `15` | 挑战页 JS 执行等待秒数（原 8s，实测不足以完成挑战跳转） |
+| `NODRIVER_MAX_SWITCH` | `3` | 单篇被拦后最多切换多少次身份重试 |
+| `NODRIVER_REQUEST_INTERVAL` | `5` | 每篇抓取后的冷却秒数（防 IP 被拉黑） |
+| `NODRIVER_DUMP_BLOCKED` | `false` | 被判定拦截时把 HTML 落盘到 `{LOG_DIR}/blocked/`，用于定位挑战页类型 |
+| `NODRIVER_FAIL_FAST_THRESHOLD` | `3` | 连续 N 篇文章全被拦后本轮跳过该通道（0=不熔断） |
 | `LOG_DIR` | `./logs` | 日志目录 |
 | `LOG_LEVEL` | `INFO` | 日志级别 |
 | `TRIGGER_LLM` | `true` | 是否触发 LLM 分析 |
@@ -154,6 +160,10 @@ journalctl -u reuters-crawler -f
 5. 日志文件按大小轮转，不无限增长。
 
 ## 十、开发记录
+
+- **2026-09-15 服务器实测（无可用代理）**：确认拦截发生在 **IP 层**（三指纹均 1546 字节 + curl_cffi 401），
+  换身份重试为无效功；据此实施 P0（dump 诊断 + 安装 playwright 内核 + 启动失败禁通道）、
+  P1（连续失败熔断）、P2（等待 8s→15s），详见 [11.4](#114-服务器实测ip-层拦截与诊断增强2026-09-15-实施)。
 
 - **2026-09-10 需求确认**：Q1 独立 Python 微服务直连 MySQL；Q2 部署海外（无需代理，保留配置）；Q3 入库后触发 LLM；Q4 正文抽取用 trafilatura；Q5 systemd 常驻 + 日志 + 崩溃自动拉起。
 - **2026-09-10 勘察结论**：既有 `server/src/reuters/` 的 `runCrawlJob` 为空壳（只写日志）且走 TypeORM（生产是 cloud_mysql），从未真正抓取；本爬虫是第一个可落地的 Reuters 爬虫，入库字段映射复用其定义。
@@ -271,6 +281,43 @@ CloudBase token 获取成功（有效期 432000s）
 t_analysis_task id=158 status=pending（触发成功）
 t_crawler_logs id=7 记录正确
 ```
+
+### 11.4 服务器实测：IP 层拦截与诊断增强（2026-09-15 实施）
+
+**实测现象**（海外服务器，`xvfb-run -a ./venv/bin/python main.py --once --dry-run`）：
+
+```
+auto 抓取失败，转浏览器: HTTP Error 401                      ← curl_cffi
+第 1/3 次被反爬拦截（身份=edge124-win，1546 字节）            ← nodriver
+第 2/3 次被反爬拦截（身份=firefox133-win，1546 字节）
+第 3/3 次被反爬拦截（身份=safari17-mac，1577 字节）
+浏览器抓取失败: Executable doesn't exist at .../chrome-headless-shell  ← playwright 内核未装
+抓不到正文，降级使用 RSS 摘要
+```
+
+**结论**：
+1. **三种完全不同的指纹（edge/firefox/safari）返回几乎一致的 1546 字节**，且 curl_cffi 先拿到 401
+   → 排除 UA/指纹因素，判定为**出口 IP 被 Reuters 边缘标记**（云主机 IP 段封禁是常态）。
+   无可用代理时，**换身份重试属于无效功**，只会拖长单轮耗时。
+2. 1546 字节走的是 `is_blocked()` 中「响应过小」分支，**签名是否命中未知** → 必须先拿到内容才能定论。
+3. Playwright 内核未安装是独立故障（且 headless 对 DataDome 本就无效），但当前实现会
+   **每篇文章都重试启动一次**，20 篇 = 20 条噪音日志。
+
+**实施项**：
+
+| 优先级 | 改动 | 作用 |
+|---|---|---|
+| P0 | `NODRIVER_DUMP_BLOCKED` 开关，被拦时 HTML 落盘 `{LOG_DIR}/blocked/` | 唯一能确定挑战页类型的手段；缺省关闭，零开销 |
+| P0 | 服务器执行 `playwright install chromium`；`BrowserFetcher` 启动失败后**本进程内禁用该通道** | 消除每篇重复的启动失败噪音 |
+| P1 | **连续失败熔断**：连续 `NODRIVER_FAIL_FAST_THRESHOLD`（默认 3）篇全被拦 → 本轮剩余文章跳过 nodriver | 单轮耗时从 ~17 分钟降到 ~1 分钟级 |
+| P2 | `NODRIVER_WAIT_SECONDS` 默认 8 → 15 | 若为挑战页等待不足，此项才有效（待 dump 结果确认） |
+
+**熔断设计要点**：
+- 计数按「**文章**」而非「身份重试次数」：同一篇内换 3 次身份仍算 1 次失败；
+- 成功抓取即清零并解除熔断；
+- 每轮 `run_once` 重新创建 `NodriverFetcher`，故**每轮自动重新探测一次**（IP 可能已恢复），
+  最多浪费 1 篇的探测成本（≈3 次身份切换）；
+- 提供 `reset()` 供外部复用实例时手动解除。
 
 ## 十二、LLM 分析微服务（2026-09-11 新增，2026-09-11 晚 迁移为 Go 实现）
 

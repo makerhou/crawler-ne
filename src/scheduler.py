@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import logging
+import os
 import time
 import uuid
 from datetime import datetime
@@ -46,6 +47,9 @@ def create_nodriver(config: Config, ua_pool: UserAgentPool | None) -> NodriverFe
         wait_seconds=config.nodriver_wait_seconds,
         max_switch=config.nodriver_max_switch,
         request_interval=config.nodriver_request_interval,
+        # 开启时把被拦的 HTML 落到 {LOG_DIR}/blocked/，用于定位挑战页类型
+        dump_dir=os.path.join(config.log_dir, "blocked") if config.nodriver_dump_blocked else "",
+        fail_fast_threshold=config.nodriver_fail_fast_threshold,
     )
 
     # 创建时自检一次：环境不满足则整个通道跳过，避免每篇文章都白试一次

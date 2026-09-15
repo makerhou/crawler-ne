@@ -179,6 +179,22 @@ class TestBrowserFetcher(unittest.TestCase):
     def test_empty_url_returns_none(self):
         self.assertIsNone(BrowserFetcher().get_html(""))
 
+    def test_launch_failure_disables_channel(self):
+        """内核缺失时只尝试启动一次，之后该通道直接返回 None（避免每篇一条噪音日志）。"""
+        fake_pw = mock.MagicMock()
+        fake_pw.chromium.launch.side_effect = RuntimeError("Executable doesn't exist")
+        fake_module = mock.MagicMock()
+        fake_module.sync_playwright.return_value.start.return_value = fake_pw
+
+        fetcher = BrowserFetcher()
+        with mock.patch.dict(sys.modules, {"playwright.sync_api": fake_module}):
+            self.assertIsNone(fetcher.get_html("https://reuters.com/a"))
+            self.assertFalse(fetcher.available)
+            # 第二次不再尝试启动
+            self.assertIsNone(fetcher.get_html("https://reuters.com/b"))
+
+        self.assertEqual(fake_module.sync_playwright.call_count, 1)
+
 
 class TestExcerpt(unittest.TestCase):
     def test_excerpt_from_extracted_content(self):

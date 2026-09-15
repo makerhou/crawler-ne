@@ -106,6 +106,28 @@ class TestConfig(unittest.TestCase):
         self.assertIsNotNone(proxies)
         self.assertEqual(proxies["http"], "http://127.0.0.1:8080")
 
+    def test_nodriver_defaults(self):
+        """等待放宽到 15s；诊断落盘默认关；熔断默认连续 3 篇。"""
+        for key in (
+            "NODRIVER_WAIT_SECONDS",
+            "NODRIVER_DUMP_BLOCKED",
+            "NODRIVER_FAIL_FAST_THRESHOLD",
+        ):
+            os.environ.pop(key, None)
+        config = Config()
+        self.assertEqual(config.nodriver_wait_seconds, 15.0)
+        self.assertFalse(config.nodriver_dump_blocked)
+        self.assertEqual(config.nodriver_fail_fast_threshold, 3)
+
+    def test_nodriver_env_override(self):
+        os.environ["NODRIVER_WAIT_SECONDS"] = "20"
+        os.environ["NODRIVER_DUMP_BLOCKED"] = "true"
+        os.environ["NODRIVER_FAIL_FAST_THRESHOLD"] = "0"  # 0 = 关闭熔断
+        config = Config()
+        self.assertEqual(config.nodriver_wait_seconds, 20.0)
+        self.assertTrue(config.nodriver_dump_blocked)
+        self.assertEqual(config.nodriver_fail_fast_threshold, 0)
+
 
 class TestDecodeGoogleNewsUrl(unittest.TestCase):
     """解码封装：成功/失败/异常均不抛错，失败返回 None。"""
