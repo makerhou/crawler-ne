@@ -1,0 +1,21 @@
+# 本地配置（含数据库密码与云密钥，禁止提交）
+# 注意用 .env* 而非 .env：否则 .env.server.bak 这类备份会漏网
+.env*
+*.bak
+
+# 虚拟环境
+venv/
+.venv/
+
+# 日志
+logs/
+*.log
+
+# 抓取预览导出（临时核查用）
+exports/
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/

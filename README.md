@@ -332,4 +332,3 @@ python main.py --once --dry-run
 - **LLM 额度**：`TRIGGER_LLM=true` 时入库即产生分析任务；当前免费额度已耗尽，
   任务会失败重试直到配额恢复——**不影响爬虫本身**。
 - **去重**：按 `t_articles.url`（解码后的真实 URL）判重，重复运行不会产生重复文章。
-# crawler-ne

@@ -160,8 +160,17 @@ class NodriverFetcher:
             except Exception as exc:  # 关闭失败不影响已获取的 HTML
                 logger.debug("关闭浏览器失败（忽略）: %s", exc)
 
-    def _run_coroutine(self, coro):
-        """执行协程：优先用 nodriver 的单例 loop，不可用时回退 asyncio.run。
+    def _run_coroutine(self, coro_factory):
+        """执行协程工厂：优先用 nodriver 的单例 loop，不可用时回退 asyncio.run。
+
+        ⚠️ 参数是「协程工厂」（每次调用返回**新的**协程），而不是协程对象：
+        协程一旦被 await 过就不能再次 await，否则抛
+        `RuntimeError: cannot reuse already awaited coroutine`。
+        旧实现在 `loop.run_until_complete(coro)` 抛异常后复用同一个协程回退，
+        导致真实错误被掩盖 —— 表现为换 3 次身份全部报同一个 coroutine 错误。
+
+        现在只在「nodriver 不可用」时回退（此时协程尚未执行，回退安全），
+        执行期间的异常直接向上抛，保留真实失败原因。
 
         不用 `asyncio.run` 的原因：反复调用会不断新建并关闭 loop，产生
         "Loop ... is closed" 告警；nodriver 自带单例 loop，更稳定。
@@ -169,14 +178,21 @@ class NodriverFetcher:
         回退场景：Python < 3.10 时 nodriver 无法导入（会抛 TypeError/SyntaxError），
         此时退化为标准 asyncio，保证其余逻辑（含测试）不受影响。
         """
+        loop = None
         try:
             import nodriver as uc
 
             loop = uc.loop()
-            return loop.run_until_complete(coro)
-        except Exception as exc:  # nodriver 不可用（低版本 Python 等）
-            logger.debug("nodriver loop 不可用，回退 asyncio.run: %s", type(exc).__name__)
-            return asyncio.run(coro)
+            if loop is not None and loop.is_closed():
+                logger.debug("nodriver 单例 loop 已关闭，改用 asyncio.run")
+                loop = None
+        except Exception as exc:  # nodriver 未安装 / Python 版本不满足
+            logger.debug("nodriver 不可用，回退 asyncio.run: %s", type(exc).__name__)
+            loop = None
+
+        if loop is None:
+            return asyncio.run(coro_factory())
+        return loop.run_until_complete(coro_factory())
 
     def get_html(self, url: str) -> str | None:
         """同步抓取；检测到拦截则自动换身份重试，全部失败返回 None。"""
@@ -188,7 +204,8 @@ class NodriverFetcher:
             self._last_profile_name = profile["name"]
 
             try:
-                html = self._run_coroutine(self._fetch_once(url, profile))
+                # 传工厂而非协程对象：重试时才能拿到全新协程
+                html = self._run_coroutine(lambda: self._fetch_once(url, profile))
             except Exception as exc:
                 logger.warning(
                     "nodriver 抓取异常（%d/%d，身份=%s）: %s",
