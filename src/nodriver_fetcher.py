@@ -7,7 +7,9 @@
 
 两个关键能力：
 1. **UA/身份自动切换**：每次请求（含重试）从身份池取下一个身份；
-2. **被检测后自动换身份重试**：识别 DataDome 拦截页后，关闭浏览器、换新身份重启再试。
+2. **代理池轮换（突破 DataDome 关键）**：PROXY_POOL 配置多个代理，命中 DataDome 拦截页后
+   关闭浏览器、换下一个出口 IP 重启再试（DataDome 根因是出口 IP 被标记，换 UA 无效）；
+3. **命中 DataDome 强特征即早退**：无更多代理时不空跑身份重试，直接放弃本篇走降级。
 """
 
 from __future__ import annotations
@@ -56,6 +58,23 @@ def is_blocked(html: str | None, min_bytes: int = MIN_VALID_BYTES) -> bool:
     return False
 
 
+def is_datadome(html: str | None) -> bool:
+    """判断是否为 DataDome 拦截页（强特征，命中即说明是 IP 层封禁，换 UA 无效）。
+
+    与 is_blocked 区分：is_blocked 还会因「内容过小」误判正常短页，
+    而 DataDome 特征（var dd= / datadome / captcha-delivery.com）是专属签名，
+    用于决策「放弃换身份、改换代理 IP」。
+    """
+    if not html:
+        return False
+    lowered = html.lower()
+    return (
+        "var dd=" in lowered
+        or "datadome" in lowered
+        or "captcha-delivery.com" in lowered
+    )
+
+
 class NodriverFetcher:
     """反检测浏览器抓取器（同步入口，内部 asyncio）。"""
 
@@ -63,6 +82,8 @@ class NodriverFetcher:
         self,
         ua_pool: UserAgentPool | None = None,
         proxies: dict[str, str] | None = None,
+        # 代理池：多个代理 URL 轮流使用，被 DataDome 拦截时换下一个 IP 重试
+        proxy_pool: list[str] | None = None,
         # 实测 DataDome 能识别 headless 模式（headless=True 必被拦），故默认有头；
         # 服务器无显示器时用 xvfb-run 启动即可。
         headless: bool = False,
@@ -74,6 +95,7 @@ class NodriverFetcher:
     ) -> None:
         self.ua_pool = ua_pool or UserAgentPool()
         self.proxies = proxies
+        self.proxy_pool = proxy_pool or []
         self.headless = headless
         self.wait_seconds = wait_seconds
         self.max_switch = max(1, max_switch)
@@ -120,12 +142,17 @@ class NodriverFetcher:
                 return path
         return None
 
-    def _proxy_server(self) -> str | None:
-        if not self.proxies:
+    def _proxy_for(self, attempt: int) -> str | None:
+        """按重试次数从代理池轮转取代理；无池则返回 None（直连）。"""
+        if not self.proxy_pool:
             return None
-        return self.proxies.get("https") or self.proxies.get("http")
+        return self.proxy_pool[(attempt - 1) % len(self.proxy_pool)]
 
-    def _browser_args(self, profile: dict[str, str]) -> list[str]:
+    def _has_more_proxies(self, attempt: int) -> bool:
+        """是否还有下一个不同的代理可换（命中 DataDome 时决定是否早退）。"""
+        return len(self.proxy_pool) > 1 and attempt < len(self.proxy_pool)
+
+    def _browser_args(self, profile: dict[str, str], proxy: str | None) -> list[str]:
         args = [
             f'--user-agent={profile["user_agent"]}',
             "--no-sandbox",
@@ -146,18 +173,17 @@ class NodriverFetcher:
             "--mute-audio",
             f'--lang={profile.get("accept_language", "en-US").split(",")[0]}',
         ]
-        proxy = self._proxy_server()
         if proxy:
             args.append(f"--proxy-server={proxy}")
         return args
 
-    async def _fetch_once(self, url: str, profile: dict[str, str]) -> str:
-        """用指定身份启动浏览器抓一次。"""
+    async def _fetch_once(self, url: str, profile: dict[str, str], proxy: str | None) -> str:
+        """用指定身份 + 指定代理启动浏览器抓一次。"""
         import nodriver as uc
 
         browser = await uc.start(
             headless=self.headless,
-            browser_args=self._browser_args(profile),
+            browser_args=self._browser_args(profile, proxy),
         )
         try:
             page = await browser.get(url)
@@ -205,11 +231,13 @@ class NodriverFetcher:
         return loop.run_until_complete(coro_factory())
 
     def get_html(self, url: str) -> str | None:
-        """同步抓取；检测到拦截则自动换身份重试，全部失败返回 None。
+        """同步抓取；命中 DataDome 则换下一个代理重试，全部失败返回 None。
 
-        熔断（`fail_fast_threshold > 0`）：连续 N 篇文章「换满身份仍被拦」时，
-        判定为 IP 层封禁（此时换 UA 是无效功），本轮剩余文章直接跳过该通道。
-        计数按「文章」计，同一篇内的多次身份切换只算 1 次失败。
+        重试策略：每次重试换「代理（取自 PROXY_POOL）+ 身份」；命中 DataDome 强特征时
+        若池里还有更多代理就切 IP 重试，否则放弃本篇（同 IP 换身份是无效功，只会拖长单轮）。
+        熔断（`fail_fast_threshold > 0`）：连续 N 篇文章「换满代理/身份仍被拦」时，
+        判定为整体出口 IP 被封，本轮剩余文章直接跳过该通道。
+        计数按「文章」计，同一篇内的多次切换只算 1 次失败。
         """
         if not url:
             return None
@@ -220,17 +248,19 @@ class NodriverFetcher:
 
         for attempt in range(1, self.max_switch + 1):
             profile = self.ua_pool.next_profile()
+            proxy = self._proxy_for(attempt)
             self._last_profile_name = profile["name"]
 
             try:
-                # 传工厂而非协程对象：重试时才能拿到全新协程
-                html = self._run_coroutine(lambda: self._fetch_once(url, profile))
+                # 传工厂而非协程对象：重试时才能拿到全新协程（含换代理/身份）
+                html = self._run_coroutine(lambda: self._fetch_once(url, profile, proxy))
             except Exception as exc:
                 logger.warning(
-                    "nodriver 抓取异常（%d/%d，身份=%s）: %s",
+                    "nodriver 抓取异常（%d/%d，身份=%s，代理=%s）: %s",
                     attempt,
                     self.max_switch,
                     profile["name"],
+                    proxy,
                     exc,
                 )
                 continue
@@ -241,24 +271,50 @@ class NodriverFetcher:
 
             if not is_blocked(html):
                 logger.info(
-                    "nodriver 抓取成功（第 %d 次，身份=%s，%d 字节）",
+                    "nodriver 抓取成功（第 %d 次，身份=%s，代理=%s，%d 字节）",
                     attempt,
                     profile["name"],
+                    proxy,
                     len(html),
                 )
                 self._consecutive_failures = 0
                 return html
 
             self._dump_blocked(html, profile, url)
+
+            # 命中 DataDome 强特征 → 根因是出口 IP 被标记，换 UA/身份无效；
+            # 直接换下一个代理（若池里有更多 IP），否则放弃本篇（避免同 IP 空跑）。
+            if is_datadome(html):
+                if self._has_more_proxies(attempt):
+                    logger.warning(
+                        "DataDome 拦截（第 %d/%d 次，身份=%s，代理=%s）→ 切换代理重试",
+                        attempt,
+                        self.max_switch,
+                        profile["name"],
+                        proxy,
+                    )
+                else:
+                    logger.warning(
+                        "DataDome 拦截（第 %d/%d 次，身份=%s，代理=%s）→ 无更多代理，"
+                        "放弃本篇（换身份无效，需配置 PROXY_POOL 住宅代理）",
+                        attempt,
+                        self.max_switch,
+                        profile["name"],
+                        proxy,
+                    )
+                    break
+                continue
+
             logger.warning(
-                "第 %d/%d 次被反爬拦截（身份=%s，%d 字节）→ 切换身份重试",
+                "第 %d/%d 次被反爬拦截（身份=%s，代理=%s，%d 字节）→ 切换身份重试",
                 attempt,
                 self.max_switch,
                 profile["name"],
+                proxy,
                 len(html),
             )
 
-        logger.error("nodriver 已切换 %d 次身份仍被拦截: %s", self.max_switch, url[:100])
+        logger.error("nodriver 已切换 %d 次仍被拦截: %s", self.max_switch, url[:100])
         self._register_failure()
         return None
 

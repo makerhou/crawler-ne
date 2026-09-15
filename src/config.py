@@ -86,7 +86,10 @@ class Config:
         self.user_agent: str = os.environ.get("USER_AGENT", DEFAULT_USER_AGENT)
 
         # 代理（可选）
+        # 单代理：HTTPS_PROXY / HTTP_PROXY（curl_cffi、rss、playwright 通道使用）
         self.proxies: dict[str, str] | None = None
+        # 代理池：PROXY_POOL（逗号分隔多个），突破 DataDome 需住宅代理轮换
+        self.proxy_pool: list[str] = []
         http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
         https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         if http_proxy or https_proxy:
@@ -95,6 +98,13 @@ class Config:
                 self.proxies["http"] = http_proxy
             if https_proxy:
                 self.proxies["https"] = https_proxy
+        # 优先读 PROXY_POOL（多代理轮转）；未配置则用单个 HTTPS_PROXY 退化为单元素池，
+        # 保证 nodriver 通道的代理取值逻辑统一。
+        pool_raw = os.environ.get("PROXY_POOL", "")
+        if pool_raw:
+            self.proxy_pool = [p.strip() for p in pool_raw.split(",") if p.strip()]
+        elif https_proxy:
+            self.proxy_pool = [https_proxy]
 
         # 日志
         self.log_dir: str = os.environ.get("LOG_DIR", "./logs")

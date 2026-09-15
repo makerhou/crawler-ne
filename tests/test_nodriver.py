@@ -15,11 +15,14 @@ from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from src.nodriver_fetcher import BLOCK_SIGNATURES, NodriverFetcher, is_blocked
+from src.nodriver_fetcher import BLOCK_SIGNATURES, NodriverFetcher, is_blocked, is_datadome
 from src.user_agents import UserAgentPool
 
 BLOCKED_HTML = "<html><head><title>reuters.com</title></head><body>var dd={'rt':'i','cid':'x'}</body></html>"
 GOOD_HTML = "<html><body><article>" + ("word " * 8000) + "</article></body></html>"
+# 非 DataDome 的一般拦截（内容过小、无 DataDome 签名）：验证「换身份重试」逻辑，
+# 以区别于命中 DataDome 强特征时的「早退/换代理」行为。
+GENERIC_BLOCKED = "<html><body>access denied - short</body></html>"
 
 
 class TestIsBlocked(unittest.TestCase):
@@ -60,7 +63,7 @@ class TestNodriverFetcher(unittest.TestCase):
 
     def test_browser_args_use_current_ua(self):
         profile = self.pool.next_profile()
-        args = self.fetcher._browser_args(profile)
+        args = self.fetcher._browser_args(profile, None)
         self.assertIn(f'--user-agent={profile["user_agent"]}', args)
         self.assertIn("--no-sandbox", args)
 
@@ -70,12 +73,12 @@ class TestNodriverFetcher(unittest.TestCase):
             proxies={"https": "socks5://1.2.3.4:1080"},
             request_interval=0,
         )
-        args = fetcher._browser_args(self.pool.next_profile())
+        args = fetcher._browser_args(self.pool.next_profile(), "socks5://1.2.3.4:1080")
         self.assertIn("--proxy-server=socks5://1.2.3.4:1080", args)
 
     def test_switches_identity_after_blocked(self):
         """第一次被拦 → 自动换身份重试 → 成功。"""
-        self.fetcher._fetch_once = mock.AsyncMock(side_effect=[BLOCKED_HTML, GOOD_HTML])
+        self.fetcher._fetch_once = mock.AsyncMock(side_effect=[GENERIC_BLOCKED, GOOD_HTML])
         html = self.fetcher.get_html("https://reuters.com/a")
         self.assertEqual(html, GOOD_HTML)
         self.assertEqual(self.fetcher._fetch_once.call_count, 2)
@@ -85,8 +88,8 @@ class TestNodriverFetcher(unittest.TestCase):
         self.assertNotEqual(p1["name"], p2["name"])
 
     def test_returns_none_after_max_switch(self):
-        """持续被拦 → 切换 max_switch 次后放弃。"""
-        self.fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+        """持续被拦（非 DataDome）→ 切换 max_switch 次后放弃。"""
+        self.fetcher._fetch_once = mock.AsyncMock(return_value=GENERIC_BLOCKED)
         self.assertIsNone(self.fetcher.get_html("https://reuters.com/a"))
         self.assertEqual(self.fetcher._fetch_once.call_count, 3)
 
@@ -136,7 +139,7 @@ class TestFailFast(unittest.TestCase):
     def test_trips_after_threshold_articles(self):
         """连续 2 篇全被拦 → 熔断，第 3 篇不再启动浏览器。"""
         fetcher = self._make(threshold=2)
-        fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+        fetcher._fetch_once = mock.AsyncMock(return_value=GENERIC_BLOCKED)
 
         self.assertIsNone(fetcher.get_html("https://reuters.com/1"))
         self.assertFalse(fetcher.tripped)
@@ -151,7 +154,7 @@ class TestFailFast(unittest.TestCase):
     def test_intra_article_switch_counts_once(self):
         """一篇内换 3 次身份只算 1 次失败 → threshold=2 时第 1 篇不熔断。"""
         fetcher = self._make(threshold=2)
-        fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+        fetcher._fetch_once = mock.AsyncMock(return_value=GENERIC_BLOCKED)
 
         fetcher.get_html("https://reuters.com/1")
         self.assertEqual(fetcher._fetch_once.call_count, 3)
@@ -162,9 +165,9 @@ class TestFailFast(unittest.TestCase):
         fetcher = self._make(threshold=2)
         fetcher._fetch_once = mock.AsyncMock(
             side_effect=[
-                BLOCKED_HTML, BLOCKED_HTML, BLOCKED_HTML,  # 篇1：换满身份仍被拦
+                GENERIC_BLOCKED, GENERIC_BLOCKED, GENERIC_BLOCKED,  # 篇1：换满身份仍被拦
                 GOOD_HTML,                                  # 篇2：成功 → 清零
-                BLOCKED_HTML, BLOCKED_HTML, BLOCKED_HTML,   # 篇3：重新开始计 1 次失败
+                GENERIC_BLOCKED, GENERIC_BLOCKED, GENERIC_BLOCKED,   # 篇3：重新开始计 1 次失败
             ]
         )
 
@@ -176,7 +179,7 @@ class TestFailFast(unittest.TestCase):
     def test_threshold_zero_never_trips(self):
         """threshold=0（关闭熔断）：每篇都正常重试。"""
         fetcher = self._make(threshold=0)
-        fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+        fetcher._fetch_once = mock.AsyncMock(return_value=GENERIC_BLOCKED)
 
         for i in range(4):
             self.assertIsNone(fetcher.get_html(f"https://reuters.com/{i}"))
@@ -186,7 +189,7 @@ class TestFailFast(unittest.TestCase):
     def test_reset_clears_trip(self):
         """reset() 后恢复探测（新一轮/换 IP 后可用）。"""
         fetcher = self._make(threshold=1)
-        fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+        fetcher._fetch_once = mock.AsyncMock(return_value=GENERIC_BLOCKED)
 
         fetcher.get_html("https://reuters.com/1")
         self.assertTrue(fetcher.tripped)
@@ -218,7 +221,8 @@ class TestDumpBlocked(unittest.TestCase):
             dump_dir=dump_dir,
         )
 
-    def test_dumps_every_blocked_response(self):
+    def test_dumps_datadome_then_early_exit(self):
+        """命中 DataDome 强特征且无可换代理时，立即放弃本篇（只落盘 1 份，不空跑身份）。"""
         with tempfile.TemporaryDirectory() as tmp:
             fetcher = self._make(dump_dir=os.path.join(tmp, "blocked"))
             fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
@@ -226,11 +230,43 @@ class TestDumpBlocked(unittest.TestCase):
             self.assertIsNone(fetcher.get_html("https://reuters.com/x"))
 
             files = os.listdir(os.path.join(tmp, "blocked"))
-            # 3 次身份切换 → 3 份样本（便于对比不同身份的响应差异）
-            self.assertEqual(len(files), 3)
+            self.assertEqual(len(files), 1)  # 早退：命中 DataDome 不再换身份重试
             body = Path(os.path.join(tmp, "blocked", files[0])).read_text(encoding="utf-8")
             self.assertIn("https://reuters.com/x", body)  # 带来源 URL 注释
             self.assertIn("var dd=", body)  # DataDome 挑战页特征原样保留
+
+    def test_rotates_proxy_pool_on_datadome(self):
+        """命中 DataDome 且代理池有多 IP 时，切到下一个代理重试（不早退）。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            fetcher = NodriverFetcher(
+                ua_pool=UserAgentPool(),
+                proxy_pool=["http://a:1@h1:1", "http://b:2@h2:2"],
+                headless=True,
+                wait_seconds=0,
+                max_switch=3,
+                request_interval=0,
+                dump_dir=os.path.join(tmp, "blocked"),
+            )
+            fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+
+            self.assertIsNone(fetcher.get_html("https://reuters.com/x"))
+
+            # 池长 2：第 1 次命中→切代理；第 2 次命中→无更多代理→早退。共 2 次。
+            self.assertEqual(fetcher._fetch_once.call_count, 2)
+            files = os.listdir(os.path.join(tmp, "blocked"))
+            self.assertEqual(len(files), 2)
+
+    def test_generic_block_still_switches_identity(self):
+        """非 DataDome 的一般拦截（内容过小）仍按 max_switch 换身份重试 3 次。"""
+        with tempfile.TemporaryDirectory() as tmp:
+            fetcher = self._make(dump_dir=os.path.join(tmp, "blocked"))
+            fetcher._fetch_once = mock.AsyncMock(return_value="<html>tiny</html>")
+
+            self.assertIsNone(fetcher.get_html("https://reuters.com/x"))
+
+            self.assertEqual(fetcher._fetch_once.call_count, 3)  # max_switch
+            files = os.listdir(os.path.join(tmp, "blocked"))
+            self.assertEqual(len(files), 3)
 
     def test_filename_contains_identity_and_size(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -270,6 +306,29 @@ class TestDumpBlocked(unittest.TestCase):
 
             self.assertIsNotNone(fetcher.get_html("https://reuters.com/x"))
             self.assertFalse(os.path.exists(os.path.join(tmp, "blocked")))
+
+
+class TestIsDatadome(unittest.TestCase):
+    """DataDome 强特征识别（与 is_blocked 区分）。"""
+
+    def test_var_dd(self):
+        self.assertTrue(is_datadome("<html>var dd={'rt':'i'}</html>"))
+
+    def test_datadome_keyword(self):
+        self.assertTrue(is_datadome("<html>datadome blocked</html>"))
+
+    def test_captcha_delivery_host(self):
+        self.assertTrue(is_datadome("host:'geo.captcha-delivery.com'"))
+
+    def test_normal_article_false(self):
+        self.assertFalse(is_datadome(GOOD_HTML))
+
+    def test_tiny_non_datadome_false(self):
+        # 内容过小会被 is_blocked 判拦截，但不是 DataDome → 仍走换身份重试
+        self.assertFalse(is_datadome("<html>tiny</html>"))
+
+    def test_none_false(self):
+        self.assertFalse(is_datadome(None))
 
 
 if __name__ == "__main__":

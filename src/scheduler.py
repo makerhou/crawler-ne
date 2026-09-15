@@ -43,6 +43,7 @@ def create_nodriver(config: Config, ua_pool: UserAgentPool | None) -> NodriverFe
     fetcher = NodriverFetcher(
         ua_pool=ua_pool or UserAgentPool(),
         proxies=config.proxies,
+        proxy_pool=config.proxy_pool,
         headless=config.nodriver_headless,
         wait_seconds=config.nodriver_wait_seconds,
         max_switch=config.nodriver_max_switch,
