@@ -207,7 +207,7 @@ ${c_green}部署完成！${c_reset}
      sudo -u $APP_USER nano $ENV_FILE
      必填：DB_HOST / DB_PORT / DB_USER / DB_PASSWORD / DB_NAME
             DASHSCOPE_API_KEY（分析服务用）
-     海外服务器请删除其中的 HTTPS_PROXY / HTTP_PROXY 两行
+     若服务器本机已跑代理（如 http://127.0.0.1:7928），请保留并填 HTTPS_PROXY / HTTP_PROXY；仅直连无障碍时删除
 
   2) 单轮验证（先不入库，看能否挖到正文）
      cd $APP_DIR && sudo -u $APP_USER xvfb-run -a ./venv/bin/python main.py --once --dry-run

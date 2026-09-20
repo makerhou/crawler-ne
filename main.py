@@ -17,7 +17,7 @@ from src.logging_setup import setup_logger
 from src.repository import ArticleRepository
 from src.scheduler import create_browser, run_forever, run_once
 
-
+ # sudo apt update && sudo apt install -y xvfb
 def main() -> int:
     parser = argparse.ArgumentParser(description="Reuters 爬虫（Google News RSS）")
     parser.add_argument("--once", action="store_true", help="只执行一轮后退出")

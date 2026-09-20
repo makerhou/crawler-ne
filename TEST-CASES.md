@@ -12,7 +12,7 @@ python3 -m venv venv && source venv/bin/activate && pip install -r requirements.
 python -m unittest discover -s tests -t . -v
 ```
 
-**结果：Ran 82 tests — OK（全部通过）**
+**结果：Ran 59 tests — OK（全部通过）**
 
 > 其中 `tests/test_pipeline_local.py` 为**本地端到端链路**用例（见第二节 TC-R2.0），
 > 用真实 headless 浏览器抓取本地 HTML，验证 RSS→解码→抓取→抽取 全流程可用（不依赖外网）。
@@ -28,10 +28,6 @@ python -m unittest discover -s tests -t . -v
 | TC-R1.25 ~ 1.31 | `TestFetchStrategy` | requests 成功/抛错/不启浏览器；**auto 无正文才启浏览器、有正文不启**；requests 失败转浏览器；playwright 恒定用浏览器；未注入浏览器不抛异常 |
 | TC-R1.32 ~ 1.35 | `TestBrowserFetcher` | 不可用返回 None；成功返回 HTML 且 goto/close 被调用；导航失败返回 None；空 URL 返回 None |
 | TC-R1.36 | `TestExcerpt` | 摘要按 limit 截断 |
-| TC-R1.37 ~ 1.38 | `TestConfig`（nodriver 项） | 默认值 `WAIT=15` / `DUMP=false` / `FAIL_FAST=3`；env 覆盖（含 `0`=关熔断） |
-| TC-R1.39 ~ 1.43 | `TestFailFast` | **连续失败熔断**：连续 2 篇被拦 → 熔断且第 3 篇不再启动浏览器；同一篇内换 3 次身份只算 1 次失败；成功即清零；`threshold=0` 永不熔断；`reset()` 解除熔断；浏览器异常同样计入 |
-| TC-R1.44 ~ 1.48 | `TestDumpBlocked` | **拦截页落盘**：每次被拦写出样本（含来源 URL 注释与原始 HTML）；文件名含身份名与字节数；未开启时不落盘不建目录；落盘失败（路径不可写）不中断抓取；成功抓取不落盘 |
-| TC-R1.49 | `TestBrowserFetcher` | 启动失败（内核缺失）后**只尝试一次**并禁用通道，后续直接返回 None |
 
 ### 1.1 LLM 分析服务用例（已迁移到 Go 项目 `llm-analysis-server`）
 
@@ -61,9 +57,6 @@ python -m unittest discover -s tests -t . -v
 | TC-R2.6 | 作者关联 | 有作者的文章 | `t_authors` 新增作者，`t_article_authors` 存在关联行 |
 | TC-R2.7 | 爬虫日志 | 查库 | `t_crawler_logs` 有 `platform='reuters'` 的记录，含 added/skipped/failed |
 | TC-R2.8 | 定时循环 | `python main.py` 常驻 | 每 300 秒执行一轮（日志时间戳间隔 ≈ 5 分钟） |
-| TC-R2.9 | 拦截页落盘（诊断） | `NODRIVER_DUMP_BLOCKED=true` 跑一次 `--once --dry-run` | `./logs/blocked/` 下生成 `*.html`，内容含来源 URL 注释；**据此判断是 DataDome 挑战页还是页面未渲染完** |
-| TC-R2.10 | 熔断生效 | 服务器无代理跑一次 `--once` | 连续 3 篇被拦后日志出现「连续 3 篇被拦，判定为 IP 层封禁」；剩余文章不再逐一尝试 nodriver，单轮耗时显著下降 |
-| TC-R2.11 | Playwright 内核 | 执行 `playwright install chromium` 后跑一次 | 不再出现 `Executable doesn't exist`；且内核缺失时该错误**每轮只出现一次**（非每篇一次） |
 
 ## 三、部署验证（systemd）
 

@@ -84,7 +84,7 @@ sudo -u www-data nano /opt/reuters-crawler/.env
 | `NODRIVER_REQUEST_INTERVAL` | ⚠️ | 每篇冷却秒数，默认 5，**建议 8** |
 | `NODRIVER_MAX_SWITCH` | 可选 | 被拦后换身份重试次数，默认 3 |
 
-> **海外服务器请删除 `.env` 里的 `HTTPS_PROXY` / `HTTP_PROXY` 两行**（那是本地调试用的）。
+> **代理说明**：若服务器本机已跑代理（如 `http://127.0.0.1:7928`），请在 `.env` 保留并填 `HTTPS_PROXY` / `HTTP_PROXY` 指向它——爬虫访问 Google/Reuters 走代理；**CloudBase 入库始终直连、不受代理影响**（`repository.py` 已 `proxies=None`）。仅在服务器直连海外无障碍时才删除这两行。
 
 ## 五、验证（按顺序）
 

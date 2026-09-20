@@ -86,10 +86,7 @@ class Config:
         self.user_agent: str = os.environ.get("USER_AGENT", DEFAULT_USER_AGENT)
 
         # 代理（可选）
-        # 单代理：HTTPS_PROXY / HTTP_PROXY（curl_cffi、rss、playwright 通道使用）
         self.proxies: dict[str, str] | None = None
-        # 代理池：PROXY_POOL（逗号分隔多个），突破 DataDome 需住宅代理轮换
-        self.proxy_pool: list[str] = []
         http_proxy = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
         https_proxy = os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
         if http_proxy or https_proxy:
@@ -98,13 +95,6 @@ class Config:
                 self.proxies["http"] = http_proxy
             if https_proxy:
                 self.proxies["https"] = https_proxy
-        # 优先读 PROXY_POOL（多代理轮转）；未配置则用单个 HTTPS_PROXY 退化为单元素池，
-        # 保证 nodriver 通道的代理取值逻辑统一。
-        pool_raw = os.environ.get("PROXY_POOL", "")
-        if pool_raw:
-            self.proxy_pool = [p.strip() for p in pool_raw.split(",") if p.strip()]
-        elif https_proxy:
-            self.proxy_pool = [https_proxy]
 
         # 日志
         self.log_dir: str = os.environ.get("LOG_DIR", "./logs")
@@ -123,19 +113,13 @@ class Config:
         # 实测：DataDome 能识别 headless 模式（headless=True 必被拦），故默认 False。
         # 服务器无显示器时用 xvfb 运行：xvfb-run -a python main.py
         self.nodriver_headless: bool = _get_bool("NODRIVER_HEADLESS", False)
-        # 挑战页 JS 执行与跳转需要时间；实测 8s 偏短，默认放宽到 15s
-        self.nodriver_wait_seconds: float = float(os.environ.get("NODRIVER_WAIT_SECONDS", "15"))
+        self.nodriver_wait_seconds: float = float(os.environ.get("NODRIVER_WAIT_SECONDS", "8"))
         # 被反爬识别后最多切换多少次身份重试
         self.nodriver_max_switch: int = _get_int("NODRIVER_MAX_SWITCH", 3)
         # 每次抓取后的冷却秒数：密集请求会让 IP 被 DataDome 快速拉黑（实测）
         self.nodriver_request_interval: float = float(
             os.environ.get("NODRIVER_REQUEST_INTERVAL", "5")
         )
-        # 被判定为拦截页时落盘 HTML（定位是 DataDome 挑战页还是页面未渲染完）
-        self.nodriver_dump_blocked: bool = _get_bool("NODRIVER_DUMP_BLOCKED", False)
-        # 连续 N 篇文章全被拦 → 本轮跳过该通道（IP 被封时换身份是无效功，只会拖长单轮）
-        # 0 表示不熔断
-        self.nodriver_fail_fast_threshold: int = _get_int("NODRIVER_FAIL_FAST_THRESHOLD", 3)
 
         # UA 轮换：round_robin / random / off（off 则使用固定 USER_AGENT）
         self.ua_rotation: str = os.environ.get("UA_ROTATION", "round_robin").strip().lower()
