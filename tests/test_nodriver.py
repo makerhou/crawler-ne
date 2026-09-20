@@ -115,5 +115,88 @@ class TestNodriverFetcher(unittest.TestCase):
             self.assertFalse(self.fetcher.available)
 
 
+# 非 DataDome 的一般拦截（内容过小、无 DataDome 签名）：用于区分
+# 「换身份重试」与「命中 DataDome 时换出口 IP」两种行为。
+GENERIC_BLOCKED = "<html><body>access denied - short</body></html>"
+
+
+class TestIpRotationOnDataDome(unittest.TestCase):
+    """命中 DataDome 强特征 → 换出口 IP 重试（换 IP 由 NodeRotator 负责）。"""
+
+    def setUp(self):
+        self.pool = UserAgentPool()
+        self.rotator = mock.Mock()
+        self.rotator.enabled = True
+        self.rotator.switch.return_value = "2.2.2.2"
+        self.fetcher = NodriverFetcher(
+            ua_pool=self.pool,
+            proxies=None,
+            headless=True,
+            wait_seconds=0,
+            max_switch=3,
+            request_interval=0,
+            rotator=self.rotator,
+            max_ip_switch=3,
+        )
+
+    def test_datadome_switches_ip_then_succeeds(self):
+        """DataDome 拦截 → 换 IP → 新 IP 上抓取成功。"""
+        self.fetcher._fetch_once = mock.AsyncMock(side_effect=[BLOCKED_HTML, GOOD_HTML])
+        html = self.fetcher.get_html("https://reuters.com/a")
+        self.assertEqual(html, GOOD_HTML)
+        self.assertEqual(self.rotator.switch.call_count, 1)
+
+    def test_no_switch_without_rotator(self):
+        """未配置面板：即便命中 DataDome 也只换身份（保持原兜底行为）。"""
+        fetcher = NodriverFetcher(
+            ua_pool=self.pool,
+            headless=True,
+            wait_seconds=0,
+            max_switch=3,
+            request_interval=0,
+            rotator=None,
+        )
+        fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+        self.assertIsNone(fetcher.get_html("https://reuters.com/a"))
+        self.assertEqual(fetcher._fetch_once.call_count, 3)
+
+    def test_generic_block_does_not_switch_ip(self):
+        """非 DataDome 的一般拦截 → 只换身份，绝不换 IP。"""
+        self.fetcher._fetch_once = mock.AsyncMock(return_value=GENERIC_BLOCKED)
+        self.assertIsNone(self.fetcher.get_html("https://reuters.com/a"))
+        self.rotator.switch.assert_not_called()
+        self.assertEqual(self.fetcher._fetch_once.call_count, 3)
+
+    def test_ip_switch_respects_limit(self):
+        """换 IP 次数达到 max_ip_switch 后停止再换。"""
+        fetcher = NodriverFetcher(
+            ua_pool=self.pool,
+            headless=True,
+            wait_seconds=0,
+            max_switch=3,
+            request_interval=0,
+            rotator=self.rotator,
+            max_ip_switch=2,
+        )
+        fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+        self.assertIsNone(fetcher.get_html("https://reuters.com/a"))
+        self.assertEqual(self.rotator.switch.call_count, 2)
+
+    def test_switch_failure_stops_retrying(self):
+        """换 IP 失败（面板不可达/IP 未变）→ 不再继续换。"""
+        self.rotator.switch.return_value = None
+        self.fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+        self.assertIsNone(self.fetcher.get_html("https://reuters.com/a"))
+        self.assertEqual(self.rotator.switch.call_count, 1)
+
+    def test_disabled_rotator_not_used(self):
+        """面板未配置(enabled=False) → 不换 IP，退回换身份。"""
+        self.rotator.enabled = False
+        self.fetcher._fetch_once = mock.AsyncMock(return_value=BLOCKED_HTML)
+        self.assertIsNone(self.fetcher.get_html("https://reuters.com/a"))
+        self.rotator.switch.assert_not_called()
+        self.assertEqual(self.fetcher._fetch_once.call_count, 3)
+
+
 if __name__ == "__main__":
     unittest.main()

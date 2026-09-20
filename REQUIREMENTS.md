@@ -272,6 +272,46 @@ t_analysis_task id=158 status=pending（触发成功）
 t_crawler_logs id=7 记录正确
 ```
 
+### 11.4 失败自动换 IP：命中 DataDome 切换 VPN 节点（2026-09-20 实施）
+
+**背景**：DataDome 封禁发生在**出口 IP 层**，换 UA/身份重试已被实测证明无效
+（2026-09-15 服务器实测：三种指纹均返回 1546 字节挑战页 + curl_cffi 401）。
+出口 IP 由服务器本地代理（如 `http://127.0.0.1:7928`）提供、节点由面板
+（aimilivpn / vpn-gate）控制，因此「换 IP」= 调用面板 API 切换 VPN 节点。
+
+**已确认决策（2026-09-20）**：
+- 触发条件：**仅**命中 DataDome 强特征（`var dd=` / `datadome` / `captcha-delivery.com`）
+  才换 IP；其他拦截（挑战页、内容过小）仅换身份重试，避免无谓切换拖慢单轮；
+- 换 IP 上限：单篇最多 **3** 次，**不熔断**（优先追求抓取成功，接受单轮耗时变长）；
+- 未配置面板时自动关闭换 IP，保持原有「单代理 + 换身份重试」行为。
+
+**实现**：
+- `src/node_rotator.py`（新增）：封装面板 API
+  - `GET /api/nodes` 拉节点（缓存 5 分钟），优选 `residential/mobile` + `quality=normal`
+    + `probe_status=available` + 未用过 + sessions 少的节点，排除 `unavailable`；
+  - `POST /api/test_node` **切换前预检**该节点可用（判定 `ok` 且非 `unavailable`）；
+  - `POST /api/connect` 切换节点；
+  - 切换后**验证出口 IP 确实变化**（经爬虫代理探测 ipify），未变化视为失败。
+- `src/nodriver_fetcher.py`：恢复 `is_datadome()`；`get_html` 命中 DataDome 强特征且
+  能换 IP 时 → 换 IP → 在新 IP 上重新走一轮换身份重试。
+- 配置项：`ROTATE_ON_BLOCK`、`NODE_PANEL_URL`、`NODE_PANEL_SESSION`、
+  `NODE_PANEL_PROXY`、`MAX_IP_SWITCH`、`NODE_PRECHECK`、`MAX_NODE_CANDIDATES`。
+
+**三个关键设计（来自踩坑）**：
+1. **访问面板默认不走爬虫代理**（`proxies=None`）：面板控制着代理本身，切换瞬间
+   代理会瞬断，若访问面板也走该代理会「自锁」；确需时用 `NODE_PANEL_PROXY` 覆盖。
+2. **切换前先预检节点可用**（`POST /api/test_node`）：实测节点池 96 个中仅 **7 个**
+   `available`、**88 个** `not_checked`，还有 `unavailable`（`ERR_OVPN_AUTH_FAILED`
+   免费节点已失效）—— 盲目切换极易切到死节点导致代理中断。预检不通过就换下一个
+   候选，上限 `MAX_NODE_CANDIDATES`（默认 5，每次预检约 4.6s）。
+3. **切换后必须验证出口 IP 变化**：避免「切了但没生效」导致白等一整轮重试。
+
+**切换前健康检查**：`switch()` 先探测当前出口 IP；探不到（代理已断）会告警并
+仍尝试换节点恢复，便于区分「代理挂了」与「被 DataDome 拦截」。
+
+**安全**：`NODE_PANEL_SESSION` 属凭据，只填 `.env`（`.gitignore` 已忽略 `.env*`），
+模板 `config.example.env` 仅保留占位符，绝不入库。
+
 ## 十二、LLM 分析微服务（2026-09-11 新增，2026-09-11 晚 迁移为 Go 实现）
 
 > **现状：分析服务已迁移为独立 Go 微服务 `llm-analysis-server`**，本目录（crawler）

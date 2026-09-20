@@ -42,6 +42,35 @@ python -m unittest discover -s tests -t . -v
 > | 任务处理（抢占失败跳过、正文缺失置 failed、重试退避、额度停止） | TC-A10 ~ A16 |
 > | 单轮编排（无任务/无 key 跳过、额度受限立即停止本轮） | TC-A17 ~ A20 |
 
+### 1.2 失败自动换 IP（2026-09-20 新增）
+
+`tests/test_node_rotator.py`（节点轮换器，mock 面板、不发起真实请求）：
+- 未配置面板 → `enabled=False`、`switch()` 返回 None（不影响主流程）
+- 节点优选：住宅 + `quality=normal` 优先 > 住宅被标代理 > 移动 > 未知；排除已用节点；
+  全部轮换一轮后重置
+- 节点列表缓存生效（不重复请求面板）；面板请求失败返回空列表而不崩溃
+- `connect` 正常 / 非 200 / 异常 三种结果处理
+- **切换前预检 `test_node`**：`available` 通过；`unavailable` / `ok=false` / 非 200 /
+  异常 均判失败；`probe_status` 缺失时以 `ok` 为准（兼容不同面板版本）
+- **预检失败 → 换下一个候选**并最终成功；全部候选都失败 → 放弃换 IP
+- 候选数达 `MAX_NODE_CANDIDATES` 上限后停止尝试；关闭预检（`precheck=False`）时
+  不做 `test_node`、直接 `connect`
+- **代理健康检查**：切换前探不到出口 IP（代理已断）→ 告警且仍尝试换节点恢复
+- **`switch` 成功**（出口 IP 变化）/ **失败**（IP 未变、探测不到 IP、`connect`
+  失败、无节点）
+- 切换成功后标记该节点已用；节点优选 `probe_status=available`、排除 `unavailable`
+- **防自锁**：访问面板的请求 `proxies=None`（不走爬虫代理）；仅配置
+  `NODE_PANEL_PROXY` 时才走代理
+- 探测出口 IP **必须**走爬虫代理（出口由代理提供）
+
+`tests/test_nodriver.py::TestIpRotationOnDataDome`（换 IP 触发逻辑）：
+- 命中 DataDome → 换 IP → 新 IP 上抓取成功
+- 未配置面板（`rotator=None`）→ 即便命中 DataDome 也只换身份 3 次（保持原兜底）
+- 非 DataDome 的一般拦截 → 只换身份，**不换 IP**
+- 换 IP 次数达到 `MAX_IP_SWITCH` 上限后停止再换
+- 换 IP 失败（返回 None）→ 停止重试
+- 面板未启用（`enabled=False`）→ 不换 IP，退回换身份
+
 ## 二、集成测试（需海外服务器 + 数据库凭据，待验证）
 
 > 本地（国内网络）`news.google.com` 不可达（`ConnectTimeout`），故以下用例需在海外服务器执行。

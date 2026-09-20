@@ -17,6 +17,7 @@ from .browser_fetcher import BrowserFetcher
 from .config import Config
 from .repository import ArticleRepository
 from .nodriver_fetcher import NodriverFetcher
+from .node_rotator import NodeRotator
 from .rss_fetcher import fetch_rss_entries
 from .url_decoder import decode_google_news_url
 from .user_agents import UserAgentPool
@@ -29,6 +30,31 @@ def create_ua_pool(config: Config) -> UserAgentPool | None:
     if config.ua_rotation == "off":
         return None
     return UserAgentPool(strategy=config.ua_rotation)
+
+
+def create_rotator(config: Config) -> NodeRotator | None:
+    """创建节点轮换器（命中 DataDome 时换出口 IP）；未配置面板则返回 None。
+
+    未配置时自动换 IP 能力关闭，保持原有的「单代理 + 换身份重试」行为。
+    """
+    if not config.rotate_on_block:
+        return None
+
+    rotator = NodeRotator(
+        panel_url=config.node_panel_url,
+        session=config.node_panel_session,
+        proxies=config.proxies,
+        panel_proxy=config.node_panel_proxy,
+        precheck=config.node_precheck,
+        max_candidates=config.max_node_candidates,
+    )
+    if not rotator.enabled:
+        logger.info(
+            "未配置 NODE_PANEL_URL/NODE_PANEL_SESSION，自动换 IP 关闭"
+            "（保持单代理 + 换身份重试）"
+        )
+        return None
+    return rotator
 
 
 def create_nodriver(config: Config, ua_pool: UserAgentPool | None) -> NodriverFetcher | None:
@@ -46,6 +72,8 @@ def create_nodriver(config: Config, ua_pool: UserAgentPool | None) -> NodriverFe
         wait_seconds=config.nodriver_wait_seconds,
         max_switch=config.nodriver_max_switch,
         request_interval=config.nodriver_request_interval,
+        rotator=create_rotator(config),
+        max_ip_switch=config.max_ip_switch,
     )
 
     # 创建时自检一次：环境不满足则整个通道跳过，避免每篇文章都白试一次

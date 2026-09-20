@@ -121,6 +121,23 @@ class Config:
             os.environ.get("NODRIVER_REQUEST_INTERVAL", "5")
         )
 
+        # ---------- 失败自动换 IP（通过面板 API 切换 VPN 节点）----------
+        # DataDome 封禁发生在**出口 IP 层**，换 UA/身份无效；命中 DataDome 强特征时
+        # 调用面板 API 切换出口节点，用新 IP 重试。
+        self.rotate_on_block: bool = _get_bool("ROTATE_ON_BLOCK", True)
+        self.node_panel_url: str = os.environ.get("NODE_PANEL_URL", "").strip()
+        # ⚠️ 敏感凭据：只放 .env（.gitignore 已忽略 .env*），切勿提交到仓库
+        self.node_panel_session: str = os.environ.get("NODE_PANEL_SESSION", "").strip()
+        # 访问面板默认直连：面板控制代理，切换瞬间代理会瞬断，走代理会自锁
+        self.node_panel_proxy: str = os.environ.get("NODE_PANEL_PROXY", "").strip()
+        # 单篇最多换几个 IP（每次成本 ≈ 重连 5s + 探测 2s + 浏览器重试 10s）
+        self.max_ip_switch: int = _get_int("MAX_IP_SWITCH", 3)
+        # 切换前先用 test_node 预检节点可用（节点池大量 not_checked/失效，
+        # 盲目切换极易切到死节点导致代理中断）
+        self.node_precheck: bool = _get_bool("NODE_PRECHECK", True)
+        # 单次换 IP 最多试几个候选节点（每个 test_node 约需 OpenVPN 连接 4.6s）
+        self.max_node_candidates: int = _get_int("MAX_NODE_CANDIDATES", 5)
+
         # UA 轮换：round_robin / random / off（off 则使用固定 USER_AGENT）
         self.ua_rotation: str = os.environ.get("UA_ROTATION", "round_robin").strip().lower()
         if self.ua_rotation not in {"round_robin", "random", "off"}:

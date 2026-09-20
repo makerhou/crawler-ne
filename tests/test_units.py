@@ -214,6 +214,9 @@ class TestNodriverCoroutineNoReuse(unittest.TestCase):
         fetcher = NodriverFetcher()
         fake_loop = mock.MagicMock()
         fake_loop.is_closed.return_value = False
+        # MagicMock 未显式设置时 is_running() 返回真值，会误走「跨线程提交」分支；
+        # 对假 loop 而言协程永不完成 → 阻塞至超时。故显式置 False 以走 run_until_complete
+        fake_loop.is_running.return_value = False
         fake_loop.run_until_complete.side_effect = RuntimeError("真实抓取失败")
 
         uc_module = mock.MagicMock()
