@@ -71,6 +71,28 @@ python -m unittest discover -s tests -t . -v
 - 换 IP 失败（返回 None）→ 停止重试
 - 面板未启用（`enabled=False`）→ 不换 IP，退回换身份
 
+### 1.3 dry-run 落本地 JSON（2026-09-21 新增）
+
+`tests/test_dry_run_output.py`（离线，无需外网/数据库）：
+- `_slugify`：保留字母/数字 → `_`；首尾标点剥离；空串回退 `article`；超长截断至 50
+- `_save_dry_run_article`：写出 `<dir>/<序号>_<slug>.json`，含**完整正文**，
+  `content_length` / `author` / `extraction_strategy` / `publish_time` / `index` / `saved_at` 均正确；
+  文件名形如 `01_Test_Title.json`
+- `_log_dry_run(..., out_dir=<dir>)`：控制台打印摘要并**额外打印落盘路径**，且文件已生成
+- `_log_dry_run(..., out_dir=None)`：仅打印、**不落盘**（验证非 dry-run 路径行为不变）
+
+### 1.4 正文图片抽取（2026-09-21 新增）
+
+`tests/test_dry_run_output.py` + `src/article_parser.extract_images`（离线，无需外网）：
+- 正文容器（`<article>`）内 `<img src>` → 转绝对 URL（`urljoin`）
+- 懒加载 `data-src` / `data-lazy-src` 可识别
+- `srcset` 取首个 URL
+- **过滤** logo/avatar/icon/advert/banner/placeholder/spinner/pixel/1x1 等非正文图
+- **容器外**（如 `<div class="ad">` 内的图）不抽取
+- 空 html → `[]`；同一 URL 去重
+- `_save_dry_run_article(..., images=[...])`：落盘 JSON 含 `images` 数组
+- `_log_dry_run` 带 `images` 时控制台打印「图片 N 张」及落盘路径
+
 ## 二、集成测试（需海外服务器 + 数据库凭据，待验证）
 
 > 本地（国内网络）`news.google.com` 不可达（`ConnectTimeout`），故以下用例需在海外服务器执行。

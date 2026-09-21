@@ -312,6 +312,40 @@ t_crawler_logs id=7 记录正确
 **安全**：`NODE_PANEL_SESSION` 属凭据，只填 `.env`（`.gitignore` 已忽略 `.env*`），
 模板 `config.example.env` 仅保留占位符，绝不入库。
 
+### 11.5 dry-run 落本地 JSON（2026-09-21 实施）
+
+**背景**：`--once --dry-run` 原只把标题/URL/作者/时间/正文字数/前 200 字摘要打到控制台，
+正文 2000~5000 字时无法核对全文（有无乱码/截断/DataDome 残留）。
+
+**改动**（`src/scheduler.py`）：
+- 新增 `_slugify` / `_save_dry_run_article`：每篇写成 `data/dryrun_<时间戳>/<序号>_<slug>.json`，
+  payload 含 `index/title/url/author/publish_time/content_length/extraction_strategy/content/saved_at`（全文，`ensure_ascii=False`）。
+- `_log_dry_run` 增加 `strategy` / `out_dir` 参数：仍打印摘要，**并额外打印落盘路径**。
+- `run_once` 在 `dry_run=True` 时创建本轮独立目录 `data/dryrun_<YYYYMMDD_HHMMSS>`；
+  仅在 `dry_run` 时落盘（`repo is None` 的非 dry-run 路径仍只打印、不落盘，保持原行为）。
+- `.gitignore` 新增 `data/`（落盘产出不入库、不提交）。
+
+**用法**：`python main.py --once --dry-run` → 控制台看摘要与路径，完整文章见
+`data/dryrun_*/<序号>_<slug>.json`（服务器上 `cat` / `jq` 查看核对）。
+
+### 11.6 dry-run 挖掘正文图片（2026-09-21 实施）
+
+**背景**：正文抽取只拿文本，文章配图被丢弃；需核对「有没有图、URL 是否正确、是否混入广告图」。
+
+**决策（与用户确认）**：图片**仅存 URL、不下载**；落地方式**仅 dry-run 落盘 + 控制台**（不入库，
+`t_articles` 加 `images` 列留作后续）。
+
+**改动**（`src/article_parser.py`）：
+- 新增 `extract_images(html, base_url, max_images=20)`：用已装的 **lxml** 解析正文容器
+  （`<article>`/`/<main>`）内 `<img>`；兼容懒加载 `data-src`/`data-lazy-src` 与 `srcset`；
+  `urljoin` 转绝对 URL；去重；过滤 logo/avatar/icon/advert/banner/placeholder/spinner/pixel/1x1 类非正文图；
+  单次最多 20 张。
+- `fetch_article_detail` 跟踪「最终采用正文来源的那份 html」（`best_html`），对其调用
+  `extract_images`，`result` 增加 `images`；`EMPTY_RESULT` 补 `"images": []`。
+- 各通道（curl_cffi / nodriver / playwright）一旦被采用为正文来源，即用其 html 抽图片，保证图片与正文同源。
+
+**dry-run 输出**：`_log_dry_run` 额外打印 `图片  : N 张` 及前 3 个 URL；落盘 JSON 增加 `images` 数组。
+
 ## 十二、LLM 分析微服务（2026-09-11 新增，2026-09-11 晚 迁移为 Go 实现）
 
 > **现状：分析服务已迁移为独立 Go 微服务 `llm-analysis-server`**，本目录（crawler）

@@ -6,10 +6,13 @@
 
 from __future__ import annotations
 
+import json
 import logging
+import re
 import time
 import uuid
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 from .article_parser import build_excerpt, fetch_article_detail, strip_html
@@ -86,15 +89,76 @@ def create_nodriver(config: Config, ua_pool: UserAgentPool | None) -> NodriverFe
     return fetcher
 
 
-def _log_dry_run(index: int, title: str, url: str, detail: dict, publish_time: str, content: str) -> None:
-    """dry-run 模式：打印挖掘到的文章内容（不入库）。"""
+def _slugify(text: str, max_len: int = 50) -> str:
+    """生成文件名安全的 slug（仅保留字母/数字/下划线/连字符）。"""
+    slug = re.sub(r"[^A-Za-z0-9]+", "_", (text or "").strip()).strip("_")
+    return slug[:max_len] or "article"
+
+
+def _save_dry_run_article(
+    out_dir: Path,
+    index: int,
+    title: str,
+    url: str,
+    author: str | None,
+    publish_time: str,
+    content: str,
+    strategy: str,
+    images: list[str] | None = None,
+) -> Path:
+    """把单篇 dry-run 结果写成 JSON（含全文与图片 URL），返回文件路径。"""
+    safe = _slugify(title)
+    path = out_dir / f"{index:02d}_{safe}.json"
+    payload = {
+        "index": index,
+        "title": title,
+        "url": url,
+        "author": author,
+        "publish_time": publish_time or None,
+        "content_length": len(content),
+        "extraction_strategy": strategy,
+        "images": images or [],
+        "content": content,
+        "saved_at": datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+    }
+    path.write_text(
+        json.dumps(payload, ensure_ascii=False, indent=2),
+        encoding="utf-8",
+    )
+    return path
+
+
+def _log_dry_run(
+    index: int,
+    title: str,
+    url: str,
+    detail: dict,
+    publish_time: str,
+    content: str,
+    strategy: str = "trafilatura",
+    out_dir: Path | None = None,
+) -> None:
+    """dry-run 模式：打印挖掘到的文章内容（不入库），可选落本地 JSON 便于核对全文。"""
     logger.info("-" * 70)
     logger.info("[%d] 标题  : %s", index, title[:100])
     logger.info("     URL  : %s", url[:120])
     logger.info("     作者  : %s", detail.get("author") or "-")
     logger.info("     时间  : %s", publish_time or "-")
+    logger.info("     策略  : %s", strategy)
     logger.info("     正文  : %d 字", len(content))
     logger.info("     摘要  : %s", content[:200].replace("\n", " "))
+
+    images = detail.get("images") or []
+    logger.info("     图片  : %d 张", len(images))
+    for img in images[:3]:
+        logger.info("       - %s", img[:160])
+
+    if out_dir is not None:
+        path = _save_dry_run_article(
+            out_dir, index, title, url, detail.get("author"), publish_time, content, strategy,
+            images=images,
+        )
+        logger.info("     已落盘: %s", path)
 
 
 def run_once(
@@ -110,6 +174,13 @@ def run_once(
     """
     started = time.time()
     stats = {"added": 0, "skipped": 0, "failed": 0}
+
+    # dry-run 时每轮建独立目录，把完整文章落本地 JSON 便于核对（不入库）
+    out_dir: Path | None = None
+    if dry_run:
+        out_dir = Path("data") / f"dryrun_{datetime.now():%Y%m%d_%H%M%S}"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        logger.info("dry-run 落盘目录: %s", out_dir)
 
     ua_pool = create_ua_pool(config)
     nodriver = create_nodriver(config, ua_pool)
@@ -191,7 +262,10 @@ def run_once(
 
         if dry_run or repo is None:
             stats["added"] += 1
-            _log_dry_run(stats["added"], title, url, detail, publish_time, content)
+            _log_dry_run(
+                stats["added"], title, url, detail, publish_time, content,
+                strategy=strategy, out_dir=out_dir,
+            )
             continue
 
         article_id = repo.insert_article(

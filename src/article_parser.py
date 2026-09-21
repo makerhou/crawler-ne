@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 import logging
 from typing import Any
+from lxml import html as lxml_html
+from urllib.parse import urljoin
 
 import requests
 import trafilatura
@@ -26,6 +28,7 @@ EMPTY_RESULT: dict[str, Any] = {
     "content": None,
     "author": None,
     "publish_time": None,
+    "images": [],
 }
 
 
@@ -125,6 +128,54 @@ def extract_article(html: str) -> dict[str, Any]:
     return result
 
 
+def extract_images(html: str, base_url: str, max_images: int = 20) -> list[str]:
+    """从正文 HTML 抽取文章配图 URL（绝对地址），过滤广告/logo/头像类。
+
+    优先在正文容器（<article>/<main>）内查找 <img>，退化为全文档；
+    兼容懒加载（data-src / data-lazy-src）与 srcset，转绝对 URL 后去重。
+    """
+    if not html:
+        return []
+    try:
+        tree = lxml_html.fromstring(html)
+    except Exception as exc:
+        logger.warning("图片解析失败（跳过）: %s", exc)
+        return []
+
+    container = tree.xpath("//article") or tree.xpath("//main") or [tree]
+    node = container[0]
+
+    seen: set[str] = set()
+    images: list[str] = []
+    non_content = ("logo", "avatar", "icon", "advert", "banner", "placeholder", "spinner", "pixel", "1x1")
+    for img in node.iter("img"):
+        raw = (
+            img.get("src")
+            or img.get("data-src")
+            or img.get("data-lazy-src")
+            or ""
+        )
+        if not raw and img.get("srcset"):
+            # srcset 形如 "url 2x, url2 1.5x"，取首个 URL
+            raw = img.get("srcset", "").split(",")[0].split(" ")[0].strip()
+        if not raw:
+            continue
+        raw = raw.strip()
+        if raw.startswith("data:"):
+            continue
+        abs_url = urljoin(base_url, raw)
+        low = abs_url.lower()
+        if any(k in low for k in non_content):
+            continue
+        if abs_url in seen:
+            continue
+        seen.add(abs_url)
+        images.append(abs_url)
+        if len(images) >= max_images:
+            break
+    return images
+
+
 def fetch_article_detail(
     url: str,
     timeout: int = 30,
@@ -178,6 +229,7 @@ def fetch_article_detail(
             )
 
     result = extract_article(html) if html else dict(EMPTY_RESULT)
+    best_html = html  # 记录最终采用正文来源的那份 html，用于抽图片
 
     # 2) nodriver 反检测通道：能执行 JS 且无 webdriver 痕迹，是突破 DataDome 的关键。
     #    内部被识别时会自动切换身份重试（见 NodriverFetcher）。
@@ -193,6 +245,7 @@ def fetch_article_detail(
                 nd_result = extract_article(nd_html)
                 if nd_result.get("content") or not result.get("content"):
                     result = nd_result
+                    best_html = nd_html
 
     # 3) playwright 轻量兜底
     need_browser = fetch_mode == "playwright" or (
@@ -201,6 +254,7 @@ def fetch_article_detail(
     if need_browser:
         if browser is None:
             logger.warning("需要浏览器兜底但未注入 BrowserFetcher | url=%s", url[:80])
+            result["images"] = extract_images(best_html, url)
             return result
 
         browser_html = browser.get_html(url)
@@ -209,7 +263,9 @@ def fetch_article_detail(
             # 浏览器拿到正文，或原结果为空 → 采用浏览器结果
             if browser_result.get("content") or not result.get("content"):
                 result = browser_result
+                best_html = browser_html
 
+    result["images"] = extract_images(best_html, url)
     return result
 
 

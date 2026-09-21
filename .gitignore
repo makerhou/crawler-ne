@@ -14,6 +14,9 @@ logs/
 # 抓取预览导出（临时核查用）
 exports/
 
+# dry-run 落盘的本地文章（临时核查用，不入库、不提交）
+data/
+
 # Python
 __pycache__/
 *.py[cod]
