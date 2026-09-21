@@ -180,8 +180,9 @@ class NodriverFetcher:
         browser = await uc.start(
             headless=self.headless,
             # root 用户必须关沙箱，否则 Chromium 拒绝启动（报错 "Failed to connect to browser"）。
-            # 注意：nodriver 接口参数是 `sandbox=False`（不是 no_sandbox=True，那是提示文案）。
-            sandbox=False,
+            # nodriver 的启动参数名是 no_sandbox=True（其报错提示文案也正是这么写的）；
+            # 之前误写成 sandbox=False 不被识别，导致 root 下浏览器起不来。
+            no_sandbox=True,
             browser_args=self._browser_args(profile),
         )
         try:

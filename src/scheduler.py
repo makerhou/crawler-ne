@@ -276,7 +276,9 @@ def run_once(
                 "summary": candidate.get("summary") or build_excerpt(content, 200) or "",
                 "url": url,
                 "content": content,
-                "images": detail.get("images") or [],
+                # CloudBase MySQL 的 JSON 列要求传入 JSON 字符串（而非对象/数组），
+                # 否则后端会把数组展开成多列 → SQL 1241 (Operand should contain 1 column(s))
+                "images": json.dumps(detail.get("images") or []),
                 "long_excerpt": build_excerpt(content, 500),
                 "publish_time": str(publish_time),
                 "content_length": len(content),
