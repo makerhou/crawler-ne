@@ -127,11 +127,11 @@ class TestFetchStrategy(unittest.TestCase):
         self.assertTrue(result["content"])
 
     def test_no_browser_injected_logs_and_returns(self):
-        """需要浏览器但没注入 → 返回已有结果，不抛异常。"""
+        """需要浏览器但没注入 → 返回空内容（不抛异常），content 由块级遍历产出（空串）。"""
         result = fetch_article_detail(
             "https://reuters.com/a", browser=None, fetch_mode="playwright"
         )
-        self.assertIsNone(result["content"])
+        self.assertFalse(result["content"])
 
 
 class TestBrowserFetcher(unittest.TestCase):

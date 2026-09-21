@@ -104,9 +104,9 @@ def _save_dry_run_article(
     publish_time: str,
     content: str,
     strategy: str,
-    images: list[str] | None = None,
+    images: list[dict[str, Any]] | None = None,
 ) -> Path:
-    """把单篇 dry-run 结果写成 JSON（含全文与图片 URL），返回文件路径。"""
+    """把单篇 dry-run 结果写成 JSON（含全文 + 图片位置列表），返回文件路径。"""
     safe = _slugify(title)
     path = out_dir / f"{index:02d}_{safe}.json"
     payload = {
@@ -151,7 +151,7 @@ def _log_dry_run(
     images = detail.get("images") or []
     logger.info("     图片  : %d 张", len(images))
     for img in images[:3]:
-        logger.info("       - %s", img[:160])
+        logger.info("       - %s (pos=%s)", img.get("url", "")[:150], img.get("position"))
 
     if out_dir is not None:
         path = _save_dry_run_article(
@@ -276,6 +276,7 @@ def run_once(
                 "summary": candidate.get("summary") or build_excerpt(content, 200) or "",
                 "url": url,
                 "content": content,
+                "images": detail.get("images") or [],
                 "long_excerpt": build_excerpt(content, 500),
                 "publish_time": str(publish_time),
                 "content_length": len(content),

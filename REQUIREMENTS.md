@@ -64,7 +64,8 @@ https://news.google.com/rss/search?q=site%3Areuters.com+markets+OR+business+OR+s
 | `title` | RSS 标题（去掉 `" - Reuters"` 后缀） | |
 | `summary` | RSS description / 正文前 200 字 | |
 | `url` | **解码后的真实 URL** | **去重键**（unique, varchar 500） |
-| `content` | trafilatura 正文 | |
+| `content` | 正文纯文本（块级遍历生成，**段间以空行保留段落边界**） | |
+| `images` | 正文图片列表 `JSONB`：`[{"url":文本,"position":int}, ...]`，`position` 为图片在 `content` 中的字符偏移，按 `position` 还原图文混排；无图为 `[]` | 2026-09-21 11.8 新增 |
 | `long_excerpt` | 正文前 500 字 | |
 | `publish_time` | RSS `pubDate` 优先，回退页面 meta | varchar(50) |
 | `content_length` | `len(content)` | |
@@ -183,6 +184,7 @@ journalctl -u reuters-crawler -f
   - 新增**降级策略**：抓不到正文时用 RSS 摘要入库并标记 `extraction_strategy='rss_fallback'`（`ALLOW_RSS_FALLBACK`，默认开），保证有数据可积累、后续可补抓
   - 实测产出：`added=3, degraded=3, failed=0`（标题/真实 URL/发布时间完整，正文为摘要）
   - 注：本机 Python 3.9 + LibreSSL 2.8.3 导致 requests 访问 Reuters 出现 `SSLV3_ALERT_HANDSHAKE_FAILURE`，**服务器上（Python 3.13 + OpenSSL 3）无此问题**
+  - **2026-09-21 正文图片单一数据源**：`content`（块级遍历，段落保留）+ `images`（`[{"url","position"}]`，position 为 content 字符偏移）取代 11.6/11.7 的 URL 列表 + `[image-N]` 锚点文本；`t_articles` 新增 `images JSON` 列（MySQL/TDSQL，非 PostgreSQL 的 JSONB）、移除 `content_anchored`，新增 `reconstruct_with_images` 还原 helper
 
 ## 十一、反爬与降级（实测结论）
 
@@ -345,6 +347,68 @@ t_crawler_logs id=7 记录正确
 - 各通道（curl_cffi / nodriver / playwright）一旦被采用为正文来源，即用其 html 抽图片，保证图片与正文同源。
 
 **dry-run 输出**：`_log_dry_run` 额外打印 `图片  : N 张` 及前 3 个 URL；落盘 JSON 增加 `images` 数组。
+
+### 11.7 dry-run 正文图片定位锚点（2026-09-21 实施，**已被 11.8 单一数据源方案取代**）
+
+**背景**：`images` 仅是按文档顺序的 URL 列表，丢失了「图片在正文第几段之后」的位置，无法还原图文混排。
+
+**决策（与用户确认）**：保留高质量纯文本 `content` 不变；新增**带 `[image-N]` 锚点的纯文本**
+`content_anchored`，锚点编号与 `images` 列表一一对应（`[image-1]` → `images[0]`）；
+落地方式**仅 dry-run 落盘 + 控制台**（不入库）。
+
+**改动**（`src/article_parser.py`）：
+- 抽出 `_img_abs_url` / `_is_non_content_image` helper，被 `extract_images` 与新增函数共用（去重）。
+- 新增 `build_anchored_content(html, base_url)`：按文档顺序遍历正文容器（`<article>`/`<main>`）
+  的块级元素，文本块拼入、图片块插入 `[image-N]` 占位符，返回 `(anchored_text, images)`；
+  二者顺序一致，据此即可把图片还原到正文原本位置。过滤 logo/广告/头像类，上限 20 张。
+- `fetch_article_detail` 在最终采用正文的 `best_html` 上调用 `build_anchored_content`，
+  给 `result` 增加 `content_anchored`；`EMPTY_RESULT` 补 `"content_anchored": ""`。
+- （`extract_images` 仍保留，单测复用其独立正确性。）
+
+**dry-run 输出**：`_log_dry_run` 打印 `图文混排 : 含 N 个 [image-N] 锚点` 及锚点预览；
+落盘 JSON 增加 `content_anchored` 字段。
+
+### 11.8 正文图片单一数据源：content + position（2026-09-21 实施，取代 11.6/11.7）
+
+**背景**：11.6 把图片存成「URL 列表」、11.7 又加一份「带 `[image-N]` 锚点的正文」——两份文本冗余，
+且 `content`（trafilatura）与锚点文本（块级遍历）**不同源**，`[image-N]` 的编号无法精确映射到
+`content` 的字符位置，还原时只能近似。
+
+**决策（与用户确认，按推荐方案）**：让 `content` 与图片位置**同源**——一次块级遍历同时产出
+纯文本 `content`（段落保留）和图片列表 `images=[{"url":..., "position":int}]`，
+`position` 是图片在 `content` 中的**字符偏移**（图片应插入在 `content[position:]` 之前）。
+据此只需**新增 `t_articles.images` 一个字段**即可还原图文混排，不再冗余存锚点文本。
+
+**改动**（`src/article_parser.py`）：
+- `build_anchored_content` → **`build_content_with_images(html, base_url)`**：返回 `(content, images)`，
+  `content` 为块级遍历纯文本（段间 `\n\n` 保留段落），`images` 为 `[{"url","position"}]`；
+  遍历中维护 `offset`（已拼入 content 的字符数）= 每张图的 `position`；过滤 logo/广告/头像类，上限 20 张。
+- `fetch_article_detail`：在最终采用的 `best_html` 上调用 `build_content_with_images`，
+  **覆盖** `result["content"]`（改为块级遍历文本，段落不丢失）与 `result["images"]`（新格式）；
+  `result["content_anchored"]` 删除，`EMPTY_RESULT` 同步移除该键。
+- `title` / `author` / `publish_time` 仍由 trafilatura（`extract_article`）产出；
+  `extraction_strategy` 仍标 `'trafilatura'`（整体抽取框架不变）。
+- 新增 `reconstruct_with_images(content, images)`：按 `position` 从右往左把图片插回 `content`，
+  用于自测与下游复用（marker 形如 `[IMG:url]`）。
+
+**改动**（`src/scheduler.py`）：
+- 入库 dict 新增 `"images": detail.get("images") or []`（透传 `JSONB`）。
+- `_log_dry_run` 打印 `图片 N 张` 及每张 `url (pos=...)`；`_save_dry_run_article` 落盘
+  `images`、**移除 `content_anchored`**。
+
+**数据库（需执行，CloudBase 为 MySQL/TDSQL）**：
+```sql
+-- MySQL 不支持 ADD COLUMN IF NOT EXISTS，用 information_schema 判断幂等
+SELECT COUNT(*) INTO @c FROM information_schema.COLUMNS
+  WHERE TABLE_SCHEMA = DATABASE() AND TABLE_NAME = 't_articles' AND COLUMN_NAME = 'images';
+SET @sql = IF(@c = 0, 'ALTER TABLE t_articles ADD COLUMN images JSON', 'SELECT 1');
+PREPARE stmt FROM @sql;
+EXECUTE stmt;
+DEALLOCATE PREPARE stmt;
+```
+
+**还原示例**：`content="第一段。\n\n第二段。"` + `images=[{"url":"a.jpg","position":4}]`
+→ `content[:4] + 图片 + content[4:]` 即还原图文混排，无需第二份文本。
 
 ## 十二、LLM 分析微服务（2026-09-11 新增，2026-09-11 晚 迁移为 Go 实现）
 

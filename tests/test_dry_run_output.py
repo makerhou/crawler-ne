@@ -4,7 +4,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from src.article_parser import extract_images
+from src.article_parser import build_content_with_images, extract_images, reconstruct_with_images
 from src.scheduler import _log_dry_run, _save_dry_run_article, _slugify
 
 
@@ -62,6 +62,54 @@ class TestExtractImages(unittest.TestCase):
         self.assertEqual(extract_images(html, self.BASE), ["https://x.com/1.jpg"])
 
 
+class TestBuildContentWithImages(unittest.TestCase):
+    HTML = (
+        "<article>"
+        "<p>第一段文字。</p>"
+        '<img src="/a.jpg" />'
+        "<p>第二段文字。</p>"
+        '<img data-src="https://cdn.reuters.com/b.png" />'
+        '<img src="https://reuters.com/logo.png" />'
+        "</article>"
+    )
+    BASE = "https://reuters.com/news/123"
+
+    def test_content_and_images(self):
+        content, imgs = build_content_with_images(self.HTML, self.BASE)
+        # 段落保留：两段文字都在 content 中，且段间有空行
+        self.assertIn("第一段文字。", content)
+        self.assertIn("第二段文字。", content)
+        self.assertIn("\n\n", content)
+        # 图片列表为 [{"url", "position"}]，跳过 logo
+        self.assertEqual(
+            imgs,
+            [
+                {"url": "https://reuters.com/a.jpg", "position": 6},
+                {"url": "https://cdn.reuters.com/b.png", "position": 14},
+            ],
+        )
+
+    def test_position_points_to_paragraph_boundary(self):
+        content, imgs = build_content_with_images(self.HTML, self.BASE)
+        # 图片应插在第一段之后（position == 第一段长度）
+        self.assertEqual(imgs[0]["position"], len("第一段文字。"))
+        self.assertEqual(content[: imgs[0]["position"]], "第一段文字。")
+
+    def test_reconstruct_restores_mixed_layout(self):
+        content, imgs = build_content_with_images(self.HTML, self.BASE)
+        restored = reconstruct_with_images(content, imgs)
+        # 两张图都还原到正确位置（第一段之后、第二段之前）
+        self.assertIn("[IMG:https://reuters.com/a.jpg]", restored)
+        self.assertIn("[IMG:https://cdn.reuters.com/b.png]", restored)
+        self.assertLess(
+            restored.index("[IMG:https://reuters.com/a.jpg]"),
+            restored.index("第二段文字。"),
+        )
+
+    def test_empty_html(self):
+        self.assertEqual(build_content_with_images("", self.BASE), ("", []))
+
+
 class TestSaveDryRunArticle(unittest.TestCase):
     def test_writes_full_content(self):
         with tempfile.TemporaryDirectory() as d:
@@ -81,6 +129,7 @@ class TestSaveDryRunArticle(unittest.TestCase):
             self.assertEqual(data["publish_time"], "2026-09-21")
             self.assertEqual(data["index"], 1)
             self.assertEqual(data["images"], [])
+            self.assertNotIn("content_anchored", data)
             self.assertIsNotNone(data["saved_at"])
 
     def test_writes_images(self):
@@ -94,6 +143,18 @@ class TestSaveDryRunArticle(unittest.TestCase):
             data = json.loads(path.read_text(encoding="utf-8"))
             self.assertEqual(data["images"], imgs)
 
+    def test_writes_images_with_position(self):
+        with tempfile.TemporaryDirectory() as d:
+            out_dir = Path(d)
+            imgs = [{"url": "https://x.com/1.jpg", "position": 3}]
+            path = _save_dry_run_article(
+                out_dir, 3, "P", "https://reuters.com/p", None, "", "c", "trafilatura",
+                images=imgs,
+            )
+            data = json.loads(path.read_text(encoding="utf-8"))
+            self.assertEqual(data["images"], imgs)
+            self.assertNotIn("content_anchored", data)
+
 
 class TestLogDryRun(unittest.TestCase):
     def test_writes_file_and_logs_when_out_dir(self):
@@ -102,20 +163,28 @@ class TestLogDryRun(unittest.TestCase):
             with self.assertLogs("reuters-crawler", level="INFO") as cm:
                 _log_dry_run(
                     1, "Title X", "https://example.com",
-                    {"author": "A", "images": ["https://x.com/a.jpg"]},
+                    {
+                        "author": "A",
+                        "images": [
+                            {"url": "https://x.com/a.jpg", "position": 3},
+                            {"url": "https://x.com/b.jpg", "position": 9},
+                        ],
+                    },
                     "2026-09-21", "全文内容" * 100,
                     strategy="trafilatura", out_dir=out_dir,
                 )
             self.assertTrue((out_dir / "01_Title_X.json").exists())
             self.assertTrue(any("已落盘" in line for line in cm.output))
             self.assertTrue(any("图片" in line for line in cm.output))
+            self.assertTrue(any("pos=" in line for line in cm.output))
 
     def test_no_file_when_out_dir_none(self):
         with tempfile.TemporaryDirectory() as d:
             with self.assertLogs("reuters-crawler", level="INFO"):
                 _log_dry_run(
-                    1, "Title", "https://example.com", {"images": []}, "", "x",
-                    out_dir=None,
+                    1, "Title", "https://example.com",
+                    {"images": [], "content": ""},
+                    "", "x", out_dir=None,
                 )
             self.assertEqual(len(list(Path(d).glob("*.json"))), 0)
 

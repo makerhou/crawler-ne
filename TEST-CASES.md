@@ -12,7 +12,7 @@ python3 -m venv venv && source venv/bin/activate && pip install -r requirements.
 python -m unittest discover -s tests -t . -v
 ```
 
-**结果：Ran 59 tests — OK（全部通过）**
+**结果：Ran 129 tests — OK（全部通过）**
 
 > 其中 `tests/test_pipeline_local.py` 为**本地端到端链路**用例（见第二节 TC-R2.0），
 > 用真实 headless 浏览器抓取本地 HTML，验证 RSS→解码→抓取→抽取 全流程可用（不依赖外网）。
@@ -92,6 +92,17 @@ python -m unittest discover -s tests -t . -v
 - 空 html → `[]`；同一 URL 去重
 - `_save_dry_run_article(..., images=[...])`：落盘 JSON 含 `images` 数组
 - `_log_dry_run` 带 `images` 时控制台打印「图片 N 张」及落盘路径
+
+### 1.5 正文图片单一数据源：content + position（2026-09-21 新增，取代旧锚点方案）
+
+`src/article_parser.build_content_with_images` + `reconstruct_with_images` + `tests/test_dry_run_output.py`（离线）：
+- 一次遍历正文块级元素：文本块拼入 `content`（段间空行，段落不丢失），图片块记录 `position`（在 content 中的字符偏移）
+- 返回 `(content, images)`，`images=[{"url":..., "position":int}, ...]`，与 `content` 同源
+- `position` 精确：`[图1]` 在第一段之后（`position == 第一段长度`）；过滤 logo/广告/头像类（`logo.png` 不计）
+- 空 html → `("", [])`
+- `reconstruct_with_images(content, images)` 按 `position` 从右往左插入，还原图文混排（验证 `[IMG:url]` 落点正确）
+- `_save_dry_run_article(..., images=[{url,position},...])`：落盘 JSON 含 `images`，**不含** `content_anchored`
+- `_log_dry_run` 带 images 时控制台打印「图片 N 张」及每张 `pos=`（如 `https://x.com/a.jpg (pos=3)`）
 
 ## 二、集成测试（需海外服务器 + 数据库凭据，待验证）
 

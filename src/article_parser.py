@@ -128,6 +128,36 @@ def extract_article(html: str) -> dict[str, Any]:
     return result
 
 
+def _img_abs_url(img: "Any", base_url: str) -> str:
+    """从 <img> 取可用绝对 URL（兼容 src / data-src / data-lazy-src / srcset 首个）。"""
+    raw = (
+        img.get("src")
+        or img.get("data-src")
+        or img.get("data-lazy-src")
+        or ""
+    )
+    if not raw and img.get("srcset"):
+        # srcset 形如 "url 2x, url2 1.5x"，取首个 URL
+        raw = img.get("srcset", "").split(",")[0].split(" ")[0].strip()
+    if not raw:
+        return ""
+    raw = raw.strip()
+    if raw.startswith("data:"):
+        return ""
+    return urljoin(base_url, raw)
+
+
+_NON_CONTENT_IMG = (
+    "logo", "avatar", "icon", "advert", "banner",
+    "placeholder", "spinner", "pixel", "1x1",
+)
+
+
+def _is_non_content_image(url: str) -> bool:
+    """过滤 logo / 头像 / 广告 / 占位等非正文图。"""
+    return any(k in url.lower() for k in _NON_CONTENT_IMG)
+
+
 def extract_images(html: str, base_url: str, max_images: int = 20) -> list[str]:
     """从正文 HTML 抽取文章配图 URL（绝对地址），过滤广告/logo/头像类。
 
@@ -147,33 +177,82 @@ def extract_images(html: str, base_url: str, max_images: int = 20) -> list[str]:
 
     seen: set[str] = set()
     images: list[str] = []
-    non_content = ("logo", "avatar", "icon", "advert", "banner", "placeholder", "spinner", "pixel", "1x1")
     for img in node.iter("img"):
-        raw = (
-            img.get("src")
-            or img.get("data-src")
-            or img.get("data-lazy-src")
-            or ""
-        )
-        if not raw and img.get("srcset"):
-            # srcset 形如 "url 2x, url2 1.5x"，取首个 URL
-            raw = img.get("srcset", "").split(",")[0].split(" ")[0].strip()
-        if not raw:
+        url = _img_abs_url(img, base_url)
+        if not url or _is_non_content_image(url) or url in seen:
             continue
-        raw = raw.strip()
-        if raw.startswith("data:"):
-            continue
-        abs_url = urljoin(base_url, raw)
-        low = abs_url.lower()
-        if any(k in low for k in non_content):
-            continue
-        if abs_url in seen:
-            continue
-        seen.add(abs_url)
-        images.append(abs_url)
+        seen.add(url)
+        images.append(url)
         if len(images) >= max_images:
             break
     return images
+
+
+def build_content_with_images(
+    html: str, base_url: str, max_images: int = 20
+) -> tuple[str, list[dict[str, Any]]]:
+    """生成纯文本正文（保留段落）+ 图片位置列表（单一数据源，可按位置还原图文混排）。
+
+    一次遍历正文容器（<article>/<main>）的块级元素：文本块拼入 `content`
+    （块间以空行分隔，段落边界不丢失），图片块记录其在 `content` 中的字符偏移
+    `position`（图片应插入在 `content[position:]` 之前）。返回的 `images` 为
+    `[{"url": ..., "position": int}, ...]`，与 `content` 同源，后续按 `position`
+    还原即可——无需再冗余存储一份带锚点的文本。
+    """
+    if not html:
+        return "", []
+    try:
+        tree = lxml_html.fromstring(html)
+    except Exception as exc:
+        logger.warning("正文解析失败（跳过）: %s", exc)
+        return "", []
+
+    container = tree.xpath("//article") or tree.xpath("//main") or [tree]
+    node = container[0]
+
+    seen: set[str] = set()
+    text_parts: list[str] = []
+    images: list[dict[str, Any]] = []
+    offset = 0          # 当前已拼入 content 的字符数（= 下一张图的 position）
+    first_text = True
+    block_tags = ("p", "h1", "h2", "h3", "h4", "h5", "h6", "li", "blockquote")
+    skip_tags = ("script", "style", "nav", "header", "footer", "aside", "noscript")
+    for el in node.iter():
+        if el.tag in skip_tags:
+            continue
+        if el.tag == "img":
+            if len(images) >= max_images:
+                continue
+            url = _img_abs_url(el, base_url)
+            if not url or _is_non_content_image(url) or url in seen:
+                continue
+            seen.add(url)
+            images.append({"url": url, "position": offset})
+        elif el.tag in block_tags:
+            text = " ".join(t.strip() for t in el.itertext() if t and t.strip())
+            if text:
+                if not first_text:
+                    offset += 2  # "\n\n" 段间分隔
+                offset += len(text)
+                first_text = False
+                text_parts.append(text)
+
+    content = "\n\n".join(text_parts)
+    return content, images
+
+
+def reconstruct_with_images(content: str, images: list[dict[str, Any]]) -> str:
+    """按 `position` 把图片还原回正文（从右往左插入，保证多个同 position 顺序正确）。
+
+    用于自测与下游复用；图片以 `[IMG:url]` 标记占位。
+    """
+    if not images:
+        return content
+    result = content
+    for img in sorted(images, key=lambda x: x.get("position", 0), reverse=True):
+        pos = img.get("position", 0)
+        result = result[:pos] + f"[IMG:{img.get('url', '')}]" + result[pos:]
+    return result
 
 
 def fetch_article_detail(
@@ -254,7 +333,9 @@ def fetch_article_detail(
     if need_browser:
         if browser is None:
             logger.warning("需要浏览器兜底但未注入 BrowserFetcher | url=%s", url[:80])
-            result["images"] = extract_images(best_html, url)
+            content_text, img_list = build_content_with_images(best_html, url)
+            result["content"] = content_text
+            result["images"] = img_list
             return result
 
         browser_html = browser.get_html(url)
@@ -265,7 +346,9 @@ def fetch_article_detail(
                 result = browser_result
                 best_html = browser_html
 
-    result["images"] = extract_images(best_html, url)
+    content_text, img_list = build_content_with_images(best_html, url)
+    result["content"] = content_text
+    result["images"] = img_list
     return result
 
 
