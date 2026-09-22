@@ -69,6 +69,28 @@ BROWSER_PROFILES: list[dict[str, str]] = [
         "accept_language": "en-US,en;q=0.9",
         "impersonate": "safari17_0",
     },
+    # ---- Linux 身份（Debian/Ubuntu 服务器环境使用，UA 与宿主机 OS 一致更自然）----
+    {
+        "name": "chrome131-linux",
+        "user_agent": (
+            "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
+            "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+        ),
+        "sec_ch_ua": '"Google Chrome";v="131", "Chromium";v="131", "Not_A Brand";v="24"',
+        "sec_ch_ua_platform": '"Linux"',
+        "accept_language": "en-US,en;q=0.9",
+        "impersonate": "chrome131",
+    },
+    {
+        "name": "firefox133-linux",
+        "user_agent": (
+            "Mozilla/5.0 (X11; Linux x86_64; rv:133.0) Gecko/20100101 Firefox/133.0"
+        ),
+        "sec_ch_ua": "",
+        "sec_ch_ua_platform": "",
+        "accept_language": "en-US,en;q=0.5",
+        "impersonate": "firefox133",
+    },
 ]
 
 _HTML_ACCEPT = (

@@ -12,12 +12,18 @@ from __future__ import annotations
 
 import json
 import logging
-from typing import Any
+from typing import Any, TYPE_CHECKING
 from lxml import html as lxml_html
 from urllib.parse import urljoin
 
 import requests
 import trafilatura
+
+if TYPE_CHECKING:
+    from .browser_fetcher import BrowserFetcher
+    from .node_rotator import NodeRotator
+    from .nodriver_fetcher import NodriverFetcher
+    from .user_agents import UserAgentPool
 
 from .browser_fetcher import BrowserFetcher
 
@@ -255,30 +261,18 @@ def reconstruct_with_images(content: str, images: list[dict[str, Any]]) -> str:
     return result
 
 
-def fetch_article_detail(
+def _fetch_article_once(
     url: str,
-    timeout: int = 30,
-    user_agent: str = "",
-    proxies: dict[str, str] | None = None,
-    browser: BrowserFetcher | None = None,
-    fetch_mode: str = "auto",
-    ua_pool: "UserAgentPool | None" = None,
-    impersonate: str = "",
-    nodriver: "NodriverFetcher | None" = None,
-) -> dict[str, Any]:
-    """抓取并解析文章，返回 {"title", "content", "author", "publish_time"}。
-
-    通道优先级：
-    - `requests`  ：普通 HTTP（无 TLS 伪装）
-    - `curl_cffi` ：模拟浏览器 TLS 指纹，但**不执行 JS**
-    - `nodriver`  ：反检测浏览器（纯 CDP，无 webdriver 痕迹）——**突破 DataDome 的关键**
-    - `playwright`：headless 浏览器（轻量兜底）
-    - `auto`（推荐）：curl_cffi → nodriver → playwright，逐级兜底
-
-    `ua_pool` 传入后每次请求轮换身份（UA + 配套头 + TLS 指纹三者一致）。
-
-    浏览器同样失败时返回已得到的结果（可能 content 为空，由上层决定跳过或降级入库）。
-    """
+    timeout: int,
+    user_agent: str,
+    proxies: dict[str, str] | None,
+    browser: BrowserFetcher | None,
+    fetch_mode: str,
+    ua_pool: "UserAgentPool | None",
+    impersonate: str,
+    nodriver: "NodriverFetcher | None",
+) -> tuple[dict[str, Any], str]:
+    """单轮抓取（不换 IP），返回 (result, best_html)。"""
     html = ""
     profile = ua_pool.next_profile() if ua_pool else None
     headers = ua_pool.build_headers("html", profile) if ua_pool else None
@@ -336,7 +330,7 @@ def fetch_article_detail(
             content_text, img_list = build_content_with_images(best_html, url)
             result["content"] = content_text
             result["images"] = img_list
-            return result
+            return result, best_html
 
         browser_html = browser.get_html(url)
         if browser_html:
@@ -346,6 +340,75 @@ def fetch_article_detail(
                 result = browser_result
                 best_html = browser_html
 
+    return result, best_html
+
+
+def fetch_article_detail(
+    url: str,
+    timeout: int = 30,
+    user_agent: str = "",
+    proxies: dict[str, str] | None = None,
+    browser: BrowserFetcher | None = None,
+    fetch_mode: str = "auto",
+    ua_pool: "UserAgentPool | None" = None,
+    impersonate: str = "",
+    nodriver: "NodriverFetcher | None" = None,
+    rotator: "NodeRotator | None" = None,
+    max_ip_switch: int = 3,
+) -> dict[str, Any]:
+    """抓取并解析文章，返回 {"title", "content", "author", "publish_time"}。
+
+    通道优先级：
+    - `requests`  ：普通 HTTP（无 TLS 伪装）
+    - `curl_cffi` ：模拟浏览器 TLS 指纹，但**不执行 JS**
+    - `nodriver`  ：反检测浏览器（纯 CDP，无 webdriver 痕迹）——**突破 DataDome 的关键**
+    - `playwright`：headless 浏览器（轻量兜底）
+    - `auto`（推荐）：curl_cffi → nodriver → playwright，逐级兜底
+
+    `ua_pool` 传入后每次请求轮换身份（UA + 配套头 + TLS 指纹三者一致）。
+
+    所有通道均失败时，若 `rotator` 可用则切换出口 IP 重试（最多 `max_ip_switch` 次）。
+
+    浏览器同样失败时返回已得到的结果（可能 content 为空，由上层决定跳过或降级入库）。
+    """
+    result: dict[str, Any] = dict(EMPTY_RESULT)
+    best_html = ""
+
+    for ip_try in range(1 + max_ip_switch):
+        result, best_html = _fetch_article_once(
+            url, timeout, user_agent, proxies, browser,
+            fetch_mode, ua_pool, impersonate, nodriver,
+        )
+
+        # 有正文 → 直接返回
+        if result.get("content"):
+            content_text, img_list = build_content_with_images(best_html, url)
+            result["content"] = content_text
+            result["images"] = img_list
+            return result
+
+        # 无正文，且还能换 IP → 切换后重试
+        if (
+            ip_try < max_ip_switch
+            and rotator is not None
+            and rotator.enabled
+        ):
+            logger.warning(
+                "所有通道均未拿到正文（第 %d/%d 轮），切换出口 IP 重试 | url=%s",
+                ip_try + 1,
+                max_ip_switch,
+                url[:80],
+            )
+            new_ip = rotator.switch()
+            if not new_ip:
+                logger.warning("切换出口 IP 失败，放弃换 IP 重试")
+                break
+            continue
+
+        # 无正文，且不能换 IP → 直接退出
+        break
+
+    # 全部失败，返回空结果
     content_text, img_list = build_content_with_images(best_html, url)
     result["content"] = content_text
     result["images"] = img_list

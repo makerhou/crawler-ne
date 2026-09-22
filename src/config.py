@@ -146,8 +146,9 @@ class Config:
         # curl_cffi 的 TLS 指纹标识（留空则跟随 UA 身份自动匹配）
         self.impersonate: str = os.environ.get("IMPERSONATE", "")
 
-        # headless 浏览器
-        self.browser_headless: bool = _get_bool("BROWSER_HEADLESS", True)
+        # headless 浏览器（默认 False：服务器用 xvfb-run 提供虚拟显示，
+        # 非 headless 模式更不易被反爬检测；若不用 xvfb 则手动设 BROWSER_HEADLESS=true）
+        self.browser_headless: bool = _get_bool("BROWSER_HEADLESS", False)
         self.browser_timeout_ms: int = _get_int("BROWSER_TIMEOUT_MS", 30_000)
         # 可选：等待某个选择器出现再取 HTML（应对纯 JS 渲染页）；留空则按 wait_ms 固定等待
         self.browser_wait_selector: str = os.environ.get("BROWSER_WAIT_SELECTOR", "")

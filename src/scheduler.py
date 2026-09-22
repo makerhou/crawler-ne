@@ -60,10 +60,17 @@ def create_rotator(config: Config) -> NodeRotator | None:
     return rotator
 
 
-def create_nodriver(config: Config, ua_pool: UserAgentPool | None) -> NodriverFetcher | None:
+def create_nodriver(
+    config: Config,
+    ua_pool: UserAgentPool | None,
+    rotator: NodeRotator | None = None,
+) -> NodriverFetcher | None:
     """创建 nodriver 反检测抓取器（仅在 fetch_mode 需要时）。
 
     nodriver 需 Python 3.10+；不可用时 `available` 为 False，通道会自动跳过。
+
+    `rotator` 由调度层统一创建后传入，与 scheduler 共享同一个实例（换 IP 时
+    nodriver 内部和 scheduler 外层使用同一个轮换器，避免状态不一致）。
     """
     if config.fetch_mode not in ("auto", "nodriver"):
         return None
@@ -75,7 +82,7 @@ def create_nodriver(config: Config, ua_pool: UserAgentPool | None) -> NodriverFe
         wait_seconds=config.nodriver_wait_seconds,
         max_switch=config.nodriver_max_switch,
         request_interval=config.nodriver_request_interval,
-        rotator=create_rotator(config),
+        rotator=rotator,
         max_ip_switch=config.max_ip_switch,
     )
 
@@ -183,7 +190,8 @@ def run_once(
         logger.info("dry-run 落盘目录: %s", out_dir)
 
     ua_pool = create_ua_pool(config)
-    nodriver = create_nodriver(config, ua_pool)
+    rotator = create_rotator(config)
+    nodriver = create_nodriver(config, ua_pool, rotator=rotator)
     entries = fetch_rss_entries(
         rss_url=config.rss_url,
         timeout=config.http_timeout,
@@ -235,6 +243,8 @@ def run_once(
                 ua_pool=ua_pool,
                 impersonate=config.impersonate,
                 nodriver=nodriver,
+                rotator=rotator,
+                max_ip_switch=config.max_ip_switch,
             )
         except Exception as exc:
             stats["failed"] += 1

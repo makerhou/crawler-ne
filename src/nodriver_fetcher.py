@@ -174,7 +174,7 @@ class NodriverFetcher:
         """用指定身份启动浏览器抓一次。"""
         import nodriver as uc
 
-        browser = await uc.start(
+        start_kwargs: dict = dict(
             headless=self.headless,
             # root 用户必须关沙箱，否则 Chromium 拒绝启动（报错 "Failed to connect to browser"）。
             # nodriver 0.50.x 参数名是 sandbox（默认 True）：
@@ -183,6 +183,12 @@ class NodriverFetcher:
             sandbox=False,
             browser_args=self._browser_args(profile),
         )
+        # 显式指定 Chrome 路径：nodriver 内部自动查找可能失败（尤其 Debian 上 chromium
+        # 装在 /usr/bin/chromium 但 nodriver 只找 google-chrome-stable）
+        chrome_path = self._find_chrome()
+        if chrome_path:
+            start_kwargs["browser_executable_path"] = chrome_path
+        browser = await uc.start(**start_kwargs)
         try:
             page = await browser.get(url)
             # 给挑战页 JS 执行与跳转的时间
@@ -195,22 +201,36 @@ class NodriverFetcher:
                 logger.debug("关闭浏览器失败（忽略）: %s", exc)
 
     def _run_coroutine(self, coro_factory):
-        """每次创建全新 event loop 执行协程，彻底避开 nodriver 单例 loop 的坑。
+        """在隔离环境中执行协程，彻底避开 event loop 冲突。
 
-        ⚠️ 历史教训（已废弃的旧方案）：
+        ⚠️ 历史教训：
 
-        旧实现尝试复用 ``uc.loop()`` 返回的单例 loop：
-        - 第 1 篇 ``run_until_complete`` 成功后，该 loop 表面停止但内部仍被 nodriver
-          后台线程绑定（``is_running()`` 返回 False，实际不可复用）；
-        - 第 2 篇起全部报 ``Cannot run the event loop while another loop is running``，
-          表现为「第 1 篇之后所有 nodriver 请求瞬间全失败、换身份也无效」。
+        1. 复用 ``uc.loop()`` 单例 loop：第 1 篇成功后 loop 被 nodriver 后台线程
+           绑定，第 2 篇起报 ``Cannot run the event loop while another loop is running``。
+        2. 直接 ``asyncio.run()``：若主线程已有 running loop（如 Playwright sync_api
+           启动的内部 loop），同样报 ``asyncio.run() cannot be called from a running event loop``。
 
-        当前方案：每次 ``asyncio.run()`` 创建全新 loop，用完即销毁，互不干扰。
-        性能代价：每次多 ~50ms loop 创建开销，相对浏览器启动（数秒）可忽略。
+        当前方案：
+        - 无 running loop → ``asyncio.run()``（最简路径）
+        - 有 running loop → ``ThreadPoolExecutor`` 在新线程中 ``asyncio.run()``
+          （每个线程有独立 event loop，互不干扰）
 
-        参数必须是「协程工厂」（每次调用返回新的协程），而非协程对象。
+        参数必须是「协程工厂」（每次调用返回新协程），而非协程对象。
         """
-        return asyncio.run(coro_factory())
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            loop = None
+
+        if loop is None:
+            # 主线程无 running loop → 直接 asyncio.run()
+            return asyncio.run(coro_factory())
+
+        # 已有 running loop → 在新线程中运行，避免冲突
+        import concurrent.futures
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
+            future = executor.submit(asyncio.run, coro_factory())
+            return future.result()
 
     def _can_switch_ip(self, ip_switches: int) -> bool:
         """是否还能切换出口 IP（需已配置节点面板且未达次数上限）。"""
