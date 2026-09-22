@@ -12,7 +12,7 @@ python3 -m venv venv && source venv/bin/activate && pip install -r requirements.
 python -m unittest discover -s tests -t . -v
 ```
 
-**结果：Ran 134 tests — OK（全部通过）**（2026-09-22 更新：新增 1.6 解码键名兼容 5 项）
+**结果：Ran 138 tests — OK（全部通过）**（2026-09-22 更新：新增三级 fallback 解码 4 项）
 
 > 其中 `tests/test_pipeline_local.py` 为**本地端到端链路**用例（见第二节 TC-R2.0），
 > 用真实 headless 浏览器抓取本地 HTML，验证 RSS→解码→抓取→抽取 全流程可用（不依赖外网）。
@@ -22,7 +22,7 @@ python -m unittest discover -s tests -t . -v
 | TC-R1.1 ~ 1.5 | `TestCleanTitle` | RSS 标题去掉 ` - Reuters` 后缀；保留标题内短横线；空串/空白安全返回 |
 | TC-R1.6 ~ 1.9 | `TestBuildExcerpt` | `None` → `None`；短文本原样；长文本截断到 500；自定义 limit 生效 |
 | TC-R1.10 ~ 1.14 | `TestConfig` | 默认值（300s / 20 / 1 / true）；env 覆盖；非法 int 回退默认；缺配置 `validate()` 抛错；代理解析 |
-| TC-R1.15 ~ 1.19 | `TestDecodeGoogleNewsUrl` | 空 URL → None；成功返回真实 URL；`status=false` → None；解码库抛异常被吞掉不中断；proxy 正确透传 |
+| TC-R1.15 ~ 1.28 | `TestDecodeGoogleNewsUrl` | 空 URL → None；库成功/失败（status + success 键兼容）；异常被吞；proxy 透传；**base64 本地解码命中真实 URL**；base64 对垃圾数据返回 None；**base64 命中时不调用库（零网络）**；库失败时 **HTTP 重定向 fallback** 取 Location |
 | TC-R1.20 ~ 1.22 | `TestRepositoryOpenidPatch` | `_openid` NOT NULL → 补 `system`；可空 → 不补；列不存在 → 不补 |
 | TC-R1.23 ~ 1.24 | `TestExtractArticle`（test_fetch） | 真实 HTML 抽出正文；空 HTML → `None` |
 | TC-R1.25 ~ 1.31 | `TestFetchStrategy` | requests 成功/抛错/不启浏览器；**auto 无正文才启浏览器、有正文不启**；requests 失败转浏览器；playwright 恒定用浏览器；未注入浏览器不抛异常 |
@@ -116,6 +116,16 @@ python -m unittest discover -s tests -t . -v
 - `success=False` 时**不回退** `status`：即便同时带 `status=True` 也判失败
 - 失败且 `message` 缺失 → 日志显示 `（库未返回错误信息）`，**不再打出 `None`**
 - proxy 透传、库抛异常被吞掉、空 URL → None（原有用例保持）
+
+### 1.7 三级 fallback 解码器（2026-09-22 新增，对应需求 11.10）
+
+`tests/test_units.py::TestDecodeGoogleNewsUrl`（离线，不发起真实网络请求）：
+
+- **base64 本地解码含明文 URL → 直接返回，无需网络**（零请求、不怕封）
+- base64 内容不含 URL（如垃圾数据 `xyz`）→ 返回 None（不报错，fall through）
+- **base64 命中时库不被调用**（验证优先级：base64 > 库）
+- 库解码失败 → **HTTP 重定向 fallback** 取 `Location` 头（302 → 真实 URL）
+- 三级全部失败 → 日志打 `三级解码均失败`，返回 None
 
 ## 二、集成测试（需海外服务器 + 数据库凭据，待验证）
 

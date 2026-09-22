@@ -2,7 +2,7 @@
 # 安装：python3 -m venv venv && source venv/bin/activate && pip install -r requirements.txt
 
 # Google News 链接解码（核心）
-googlenewsdecoder>=0.1.7
+googlenewsdecoder>=0.2.0
 
 # RSS 解析
 feedparser>=6.0.10

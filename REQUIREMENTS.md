@@ -437,6 +437,36 @@ DEALLOCATE PREPARE stmt;
 **遗留**：`Failed to fetch data attributes from Google News.` 属 Google 侧偶发/反爬的
 **真失败**，需靠代理或换 IP（见 11.4）缓解，不属本次修复范围。
 
+### 11.10 三级 fallback 解码器 + 库升级至 0.2.x（2026-09-22 实施）
+
+**背景**：11.9 修复后，服务器（美国 Buffalo，出口 US）直连解码仍全部返回
+`{'success': False, 'message': 'Failed to fetch data attributes from Google News.'}`。
+根因是旧版 `googlenewsdecoder`（< 0.2.0）靠 DOM 解析 Google News 页面，
+Google 2024 年后改了页面结构导致解析逻辑失效。
+
+**根因排查**：
+- `curl https://news.google.com/rss/search?q=test` → 302（能连，非封禁）
+- 出口 IP 在 Buffalo, NY, US（非欧洲 consent 跳转）
+- `gnewsdecoder(url)` 直接返回 `{'success': False, 'message': 'Failed to fetch data attributes...'}`
+- PyPI 上 `googlenewsdecoder` 0.2.1（2026-09-20 发布）用 `batchexecute` POST 重写了完整解码机制
+
+**改动**：
+
+1. **`requirements.txt`**：`googlenewsdecoder>=0.1.7` → `>=0.2.0`
+2. **`src/url_decoder.py`** 重写为三级 fallback：
+
+| 级 | 方法 | 网络 | 适用 |
+|---|---|---|---|
+| 1 | Base64 本地解码 | 无 | RSS URL 中 `/articles/CBM...` 含 protobuf+base64 编码的原始 URL（旧格式） |
+| 2 | `googlenewsdecoder` 库 | 有 | 主力解码，兼容新旧版 `success`/`status` + `decoded_url`/`url` 键 |
+| 3 | HTTP 重定向跟踪 | 有 | 最朴素的备用：GET + `allow_redirects=False` 取 `Location` 头 |
+
+- 优先级：base64 > 库 > 重定向。base64 命中时**零网络请求**（最快、不怕封）。
+- 三级全失败时日志打 `三级解码均失败`（不再出现 `None` 或 `库未返回错误信息`）。
+
+**影响面**：仅 `src/url_decoder.py` 解码逻辑 + `requirements.txt` 版本约束。
+调度、抓取、入库、换 IP 等不受影响。
+
 ## 十二、LLM 分析微服务（2026-09-11 新增，2026-09-11 晚 迁移为 Go 实现）
 
 > **现状：分析服务已迁移为独立 Go 微服务 `llm-analysis-server`**，本目录（crawler）

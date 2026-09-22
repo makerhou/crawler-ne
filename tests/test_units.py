@@ -20,7 +20,7 @@ from src.config import Config
 from src.nodriver_fetcher import NodriverFetcher
 from src.repository import ArticleRepository
 from src.rss_fetcher import clean_title
-from src.url_decoder import decode_google_news_url
+from src.url_decoder import decode_google_news_url, _decode_base64, _decode_via_redirect
 
 
 class TestCleanTitle(unittest.TestCase):
@@ -108,7 +108,17 @@ class TestConfig(unittest.TestCase):
 
 
 class TestDecodeGoogleNewsUrl(unittest.TestCase):
-    """解码封装：成功/失败/异常均不抛错，失败返回 None。"""
+    """解码封装：三级 fallback（base64 → 库 → 重定向），均不抛错。"""
+
+    def setUp(self):
+        # 所有测试默认关闭重定向 fallback，避免单测走真实网络
+        self._redirect_patcher = mock.patch(
+            "src.url_decoder._decode_via_redirect", return_value=None
+        )
+        self._redirect_patcher.start()
+
+    def tearDown(self):
+        self._redirect_patcher.stop()
 
     def test_empty_url(self):
         self.assertIsNone(decode_google_news_url(""))
@@ -196,7 +206,7 @@ class TestDecodeGoogleNewsUrl(unittest.TestCase):
         self.assertEqual(result, "https://www.reuters.com/article/legacy")
 
     def test_failure_message_placeholder_when_missing(self):
-        """失败且库未给 message → 日志不再打 None，而用占位文案。"""
+        """三级解码均失败 → 日志打"三级解码均失败"，不再出现 None。"""
         fake_module = mock.MagicMock()
         fake_module.gnewsdecoder.return_value = {"success": False}
         with mock.patch.dict(sys.modules, {"googlenewsdecoder": fake_module}):
@@ -204,7 +214,66 @@ class TestDecodeGoogleNewsUrl(unittest.TestCase):
                 result = decode_google_news_url("https://news.google.com/rss/articles/xyz")
         self.assertIsNone(result)
         self.assertNotIn("None", cm.output[0])
-        self.assertIn("库未返回错误信息", cm.output[0])
+        self.assertIn("三级解码均失败", cm.output[0])
+
+    # ---- 三级 fallback：base64 本地解码 ----
+
+    def test_base64_decode_real_url(self):
+        """含明文 URL 的 base64 URL → 本地直接解出，无需网络。"""
+        # 手工构造：base64("https://www.reuters.com/test-art") 加 protobuf 前缀
+        import base64 as b64
+        raw = b"https://www.reuters.com/test-art"
+        # protobuf tag: \x08\x01\x12\x20 (field1=1, field2 len-prefixed) + length byte
+        prefix = b"\x08\x01\x12" + bytes([len(raw)])
+        encoded = b64.urlsafe_b64encode(prefix + raw).decode().rstrip("=")
+        url = f"https://news.google.com/rss/articles/{encoded}"
+        result = _decode_base64(url)
+        self.assertEqual(result, "https://www.reuters.com/test-art")
+
+    def test_base64_decode_returns_none_for_garbage(self):
+        """base64 内容不含 URL → 返回 None（不报错）。"""
+        self.assertIsNone(_decode_base64("https://news.google.com/rss/articles/xyz"))
+
+    def test_base64_wins_over_library(self):
+        """base64 能解出时，不会调用库（零网络请求优先）。"""
+        import base64 as b64
+        raw = b"https://example.com/article-1"
+        prefix = b"\x08\x01\x12" + bytes([len(raw)])
+        encoded = b64.urlsafe_b64encode(prefix + raw).decode().rstrip("=")
+        url = f"https://news.google.com/rss/articles/{encoded}"
+
+        fake_module = mock.MagicMock()
+        fake_module.gnewsdecoder.return_value = {
+            "success": True,
+            "decoded_url": "https://should-not-be-used.com",
+        }
+        with mock.patch.dict(sys.modules, {"googlenewsdecoder": fake_module}):
+            result = decode_google_news_url(url)
+        # base64 解码优先，库不应被调用
+        self.assertEqual(result, "https://example.com/article-1")
+        fake_module.gnewsdecoder.assert_not_called()
+
+    # ---- 三级 fallback：HTTP 重定向 ----
+
+    def test_redirect_fallback_on_library_failure(self):
+        """库解码失败 → 自动尝试 HTTP 重定向。"""
+        fake_module = mock.MagicMock()
+        fake_module.gnewsdecoder.return_value = {"success": False, "message": "parse error"}
+
+        # 临时放开 redirect mock
+        self._redirect_patcher.stop()
+        try:
+            fake_resp = mock.MagicMock()
+            fake_resp.status_code = 302
+            fake_resp.headers = {"Location": "https://www.reuters.com/redirect-target"}
+
+            with mock.patch.dict(sys.modules, {"googlenewsdecoder": fake_module}), \
+                 mock.patch("requests.get", return_value=fake_resp):
+                result = decode_google_news_url("https://news.google.com/rss/articles/abc123")
+        finally:
+            self._redirect_patcher.start()
+
+        self.assertEqual(result, "https://www.reuters.com/redirect-target")
 
 
 class TestRepositoryOpenidCompat(unittest.TestCase):
