@@ -328,72 +328,37 @@ async def _dummy_coro(value: str) -> str:
 
 
 class TestNodriverCoroutineNoReuse(unittest.TestCase):
-    """协程不得被重复 await。
+    """_run_coroutine 每次用 asyncio.run() 创建全新 event loop。
 
-    回归背景：旧实现在 `loop.run_until_complete(coro)` 抛异常后，
-    用**同一个协程对象**回退 `asyncio.run(coro)`，于是报
-    "cannot reuse already awaited coroutine"，真实错误被掩盖，
-    表现为换 3 次身份全部失败且错误信息一模一样。
+    回归背景：旧实现复用 nodriver 单例 loop（uc.loop()），第 1 篇成功后
+    loop 处于「表面停止但内部仍被绑定」状态，第 2 篇起全部报
+    ``Cannot run the event loop while another loop is running``。
+
+    当前实现每次 ``asyncio.run()`` 创建全新 loop，彻底避开单例 loop 的坑。
     """
 
-    def test_execution_error_propagates_without_reuse(self):
-        """执行中异常：直接向上抛，不拿旧协程重试。"""
+    def test_success_returns_result(self):
+        """正常执行返回协程结果。"""
         fetcher = NodriverFetcher()
-        fake_loop = mock.MagicMock()
-        fake_loop.is_closed.return_value = False
-        # MagicMock 未显式设置时 is_running() 返回真值，会误走「跨线程提交」分支；
-        # 对假 loop 而言协程永不完成 → 阻塞至超时。故显式置 False 以走 run_until_complete
-        fake_loop.is_running.return_value = False
-        fake_loop.run_until_complete.side_effect = RuntimeError("真实抓取失败")
+        result = fetcher._run_coroutine(lambda: _dummy_coro("ok"))
+        self.assertEqual(result, "ok")
 
-        uc_module = mock.MagicMock()
-        uc_module.loop.return_value = fake_loop
+    def test_error_propagates(self):
+        """协程中异常直接向上抛，不被吞掉。"""
+        async def _failing_coro():
+            raise RuntimeError("真实抓取失败")
 
-        created: list = []
-
-        def factory():
-            coro = _dummy_coro("html")
-            created.append(coro)
-            return coro
-
-        with mock.patch.dict(sys.modules, {"nodriver": uc_module}):
-            with self.assertRaises(RuntimeError) as ctx:
-                fetcher._run_coroutine(factory)
-
+        fetcher = NodriverFetcher()
+        with self.assertRaises(RuntimeError) as ctx:
+            fetcher._run_coroutine(lambda: _failing_coro())
         self.assertIn("真实抓取失败", str(ctx.exception))
-        # 只创建过 1 个协程：说明没有拿已 await 的协程去回退
-        self.assertEqual(len(created), 1)
-        self.assertEqual(fake_loop.run_until_complete.call_count, 1)
 
-        # mock 不会真正 await 协程，手动关闭以免 "was never awaited" 警告
-        for coro in created:
-            coro.close()
-
-    def test_loop_unavailable_falls_back_with_fresh_coroutine(self):
-        """nodriver 不可用时回退 asyncio.run（协程尚未执行，安全）。"""
+    def test_multiple_calls_succeed(self):
+        """连续多次调用均能成功（回归：旧实现第 2 次起必失败）。"""
         fetcher = NodriverFetcher()
-        uc_module = mock.MagicMock()
-        uc_module.loop.side_effect = TypeError("需要 Python 3.10+")
-
-        with mock.patch.dict(sys.modules, {"nodriver": uc_module}):
-            result = fetcher._run_coroutine(lambda: _dummy_coro("ok"))
-
-        self.assertEqual(result, "ok")
-
-    def test_closed_loop_falls_back_to_asyncio_run(self):
-        """单例 loop 已关闭时改用 asyncio.run，避免 'Loop is closed'。"""
-        fetcher = NodriverFetcher()
-        fake_loop = mock.MagicMock()
-        fake_loop.is_closed.return_value = True
-
-        uc_module = mock.MagicMock()
-        uc_module.loop.return_value = fake_loop
-
-        with mock.patch.dict(sys.modules, {"nodriver": uc_module}):
-            result = fetcher._run_coroutine(lambda: _dummy_coro("ok"))
-
-        self.assertEqual(result, "ok")
-        fake_loop.run_until_complete.assert_not_called()
+        for i in range(3):
+            result = fetcher._run_coroutine(lambda: _dummy_coro(f"ok-{i}"))
+            self.assertEqual(result, f"ok-{i}")
 
 
 if __name__ == "__main__":

@@ -104,9 +104,6 @@ class NodriverFetcher:
         self.max_ip_switch = max(0, max_ip_switch)
         # 每次抓取后的冷却：实测密集请求会让 IP 被 DataDome 快速拉黑
         self.request_interval = max(0.0, request_interval)
-        # 跨线程提交协程时的阻塞超时：浏览器启动 + 等待挑战页通常 < 60s，
-        # 给足余量防止个别卡死请求把整轮挂住
-        self._coroutine_timeout: float = 180.0
         self._last_profile_name: str = ""
 
     @property
@@ -198,48 +195,22 @@ class NodriverFetcher:
                 logger.debug("关闭浏览器失败（忽略）: %s", exc)
 
     def _run_coroutine(self, coro_factory):
-        """执行协程工厂：优先复用 nodriver 的单例 loop，不可用/已在运行时妥善回退。
+        """每次创建全新 event loop 执行协程，彻底避开 nodriver 单例 loop 的坑。
 
-        ⚠️ 这里有两个必须避开的坑，都与「换身份重试」直接相关：
+        ⚠️ 历史教训（已废弃的旧方案）：
 
-        1. **协程不可复用**：参数必须是「协程工厂」（每次调用返回**新的**协程），
-           而不是协程对象。协程一旦被 await 过就不能再次 await，否则抛
-           `RuntimeError: cannot reuse already awaited coroutine`。
-           旧实现在 `loop.run_until_complete(coro)` 抛异常后复用同一个协程回退，
-           真实错误被掩盖 —— 表现为换 3 次身份全部报同一个 coroutine 错误。
+        旧实现尝试复用 ``uc.loop()`` 返回的单例 loop：
+        - 第 1 篇 ``run_until_complete`` 成功后，该 loop 表面停止但内部仍被 nodriver
+          后台线程绑定（``is_running()`` 返回 False，实际不可复用）；
+        - 第 2 篇起全部报 ``Cannot run the event loop while another loop is running``，
+          表现为「第 1 篇之后所有 nodriver 请求瞬间全失败、换身份也无效」。
 
-        2. **单例 loop 可能已经在运行**：nodriver 内部会把自己的 loop 跑在后台线程。
-           第 1 次 `run_until_complete` 之后该 loop 进入 running 状态，此时再对它
-           `run_until_complete` 会抛
-           `RuntimeError: Cannot run the event loop while another loop is running`
-           —— 表现为**第 1 篇之后所有 nodriver 请求瞬间全失败、换身份也无效**，
-           日志上极像"IP 被封禁"，实则是基础设施错误，浏览器压根没启动过。
+        当前方案：每次 ``asyncio.run()`` 创建全新 loop，用完即销毁，互不干扰。
+        性能代价：每次多 ~50ms loop 创建开销，相对浏览器启动（数秒）可忽略。
 
-           解决：loop 正在运行 → 用 `asyncio.run_coroutine_threadsafe` 跨线程提交并
-           阻塞取结果；loop 为空/已关闭（如 Python < 3.10 导致 nodriver 不可用）
-           → 用 `asyncio.run` 新建 loop。
+        参数必须是「协程工厂」（每次调用返回新的协程），而非协程对象。
         """
-        loop = None
-        try:
-            import nodriver as uc
-
-            loop = uc.loop()
-            if loop is not None and loop.is_closed():
-                logger.debug("nodriver 单例 loop 已关闭，改用 asyncio.run")
-                loop = None
-        except Exception as exc:  # nodriver 未安装 / Python 版本不满足
-            logger.debug("nodriver 不可用，回退 asyncio.run: %s", type(exc).__name__)
-            loop = None
-
-        if loop is None:
-            return asyncio.run(coro_factory())
-
-        if loop.is_running():
-            # loop 已在别的线程跑着：跨线程提交，阻塞等待结果（带超时防挂死）
-            future = asyncio.run_coroutine_threadsafe(coro_factory(), loop)
-            return future.result(timeout=self._coroutine_timeout)
-
-        return loop.run_until_complete(coro_factory())
+        return asyncio.run(coro_factory())
 
     def _can_switch_ip(self, ip_switches: int) -> bool:
         """是否还能切换出口 IP（需已配置节点面板且未达次数上限）。"""
