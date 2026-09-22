@@ -12,7 +12,7 @@ python3 -m venv venv && source venv/bin/activate && pip install -r requirements.
 python -m unittest discover -s tests -t . -v
 ```
 
-**结果：Ran 129 tests — OK（全部通过）**
+**结果：Ran 134 tests — OK（全部通过）**（2026-09-22 更新：新增 1.6 解码键名兼容 5 项）
 
 > 其中 `tests/test_pipeline_local.py` 为**本地端到端链路**用例（见第二节 TC-R2.0），
 > 用真实 headless 浏览器抓取本地 HTML，验证 RSS→解码→抓取→抽取 全流程可用（不依赖外网）。
@@ -103,6 +103,19 @@ python -m unittest discover -s tests -t . -v
 - `reconstruct_with_images(content, images)` 按 `position` 从右往左插入，还原图文混排（验证 `[IMG:url]` 落点正确）
 - `_save_dry_run_article(..., images=[{url,position},...])`：落盘 JSON 含 `images`，**不含** `content_anchored`
 - `_log_dry_run` 带 images 时控制台打印「图片 N 张」及每张 `pos=`（如 `https://x.com/a.jpg (pos=3)`）
+
+### 1.6 解码成功键兼容：success / status（2026-09-22 新增，对应需求 11.9）
+
+`tests/test_units.py::TestDecodeGoogleNewsUrl`（离线，mock 库、不发起真实请求）：
+
+- **库返回 `{"success": True, "decoded_url": ...}` → 能取到真实 URL**（核心回归用例：
+  修复前因只认 `status` 键被误判为失败）
+- 库返回 `{"success": False, "message": "..."}` → 返回 None（真失败）
+- 旧版 `{"status": True, "decoded_url": ...}`（无 `success` 键）→ 仍能取到 URL（兼容）
+- 旧版 `{"status": False, "message": ...}` → None（原有用例保持）
+- `success=False` 时**不回退** `status`：即便同时带 `status=True` 也判失败
+- 失败且 `message` 缺失 → 日志显示 `（库未返回错误信息）`，**不再打出 `None`**
+- proxy 透传、库抛异常被吞掉、空 URL → None（原有用例保持）
 
 ## 二、集成测试（需海外服务器 + 数据库凭据，待验证）
 

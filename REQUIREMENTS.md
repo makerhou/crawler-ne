@@ -410,6 +410,33 @@ DEALLOCATE PREPARE stmt;
 **还原示例**：`content="第一段。\n\n第二段。"` + `images=[{"url":"a.jpg","position":4}]`
 → `content[:4] + 图片 + content[4:]` 即还原图文混排，无需第二份文本。
 
+### 11.9 修复解码成功被误判为失败（2026-09-22 实施）
+
+**背景（线上实测暴露）**：`googlenewsdecoder` 实际返回的是
+`{"success": bool, "message": str}`（失败时如
+`{'success': False, 'message': 'Failed to fetch data attributes from Google News.'}`），
+而 `src/url_decoder.py` 判断的是 `result.get("status")`。新版库**成功返回里没有 `status` 键**，于是：
+
+- `result.get("status")` → `None` → 被判为失败 → 该条 `continue` 跳过；
+- 成功返回也**没有 `message` 键** → `result.get("message")` → `None`
+  → 日志打出 `解码失败（跳过该条）: None`。
+
+**后果**：绝大多数**解码其实成功**的条目被误判为失败并跳过，表现为「解码全失败、
+挖不到数据」。服务器（美国 Buffalo；直连 `news.google.com` 返回 302，非封禁、非 consent
+跳转）实测确认即此 bug。
+
+**改动**（`src/url_decoder.py`）：
+- 成功判断**兼容两种键名**：`success` 优先，缺失时回退 `status`
+  （旧版本库返回 `{"status": bool, "decoded_url": ...}` 仍可用）；
+- `success` 为 `False` 时**不回退** `status`（避免把真失败误判成成功）；
+- 失败日志的 `message` 为 `None` 时显示 `（库未返回错误信息）`，不再打出 `None`，
+  便于区分「真失败」与「库未给原因」。
+
+**影响面**：仅解码成功/失败判定，不影响调度、抓取、入库、换 IP 等其它逻辑。
+
+**遗留**：`Failed to fetch data attributes from Google News.` 属 Google 侧偶发/反爬的
+**真失败**，需靠代理或换 IP（见 11.4）缓解，不属本次修复范围。
+
 ## 十二、LLM 分析微服务（2026-09-11 新增，2026-09-11 晚 迁移为 Go 实现）
 
 > **现状：分析服务已迁移为独立 Go 微服务 `llm-analysis-server`**，本目录（crawler）

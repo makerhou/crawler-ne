@@ -148,6 +148,64 @@ class TestDecodeGoogleNewsUrl(unittest.TestCase):
         _, kwargs = fake_module.gnewsdecoder.call_args
         self.assertEqual(kwargs["proxy"], "http://p:8080")
 
+    # ---- 需求 11.9：googlenewsdecoder 新版返回 success 键，旧版返回 status 键 ----
+
+    def test_success_with_success_key(self):
+        """新版库用 success=True：必须能取到 URL（修复前会被误判为失败）。"""
+        fake_module = mock.MagicMock()
+        fake_module.gnewsdecoder.return_value = {
+            "success": True,
+            "decoded_url": "https://www.reuters.com/article/789",
+        }
+        with mock.patch.dict(sys.modules, {"googlenewsdecoder": fake_module}):
+            result = decode_google_news_url("https://news.google.com/rss/articles/xyz")
+        self.assertEqual(result, "https://www.reuters.com/article/789")
+
+    def test_failure_with_success_key(self):
+        """新版库 success=False（真失败）→ None。"""
+        fake_module = mock.MagicMock()
+        fake_module.gnewsdecoder.return_value = {
+            "success": False,
+            "message": "Failed to fetch data attributes from Google News.",
+        }
+        with mock.patch.dict(sys.modules, {"googlenewsdecoder": fake_module}):
+            result = decode_google_news_url("https://news.google.com/rss/articles/xyz")
+        self.assertIsNone(result)
+
+    def test_success_false_not_fallback_to_status(self):
+        """success=False 时不回退 status：即便带 status=True 也判失败。"""
+        fake_module = mock.MagicMock()
+        fake_module.gnewsdecoder.return_value = {
+            "success": False,
+            "status": True,
+            "decoded_url": "https://www.reuters.com/article/should-not-use",
+        }
+        with mock.patch.dict(sys.modules, {"googlenewsdecoder": fake_module}):
+            result = decode_google_news_url("https://news.google.com/rss/articles/xyz")
+        self.assertIsNone(result)
+
+    def test_legacy_status_key_still_works(self):
+        """旧版库只有 status 键（无 success）→ 兼容成功。"""
+        fake_module = mock.MagicMock()
+        fake_module.gnewsdecoder.return_value = {
+            "status": True,
+            "decoded_url": "https://www.reuters.com/article/legacy",
+        }
+        with mock.patch.dict(sys.modules, {"googlenewsdecoder": fake_module}):
+            result = decode_google_news_url("https://news.google.com/rss/articles/xyz")
+        self.assertEqual(result, "https://www.reuters.com/article/legacy")
+
+    def test_failure_message_placeholder_when_missing(self):
+        """失败且库未给 message → 日志不再打 None，而用占位文案。"""
+        fake_module = mock.MagicMock()
+        fake_module.gnewsdecoder.return_value = {"success": False}
+        with mock.patch.dict(sys.modules, {"googlenewsdecoder": fake_module}):
+            with self.assertLogs("reuters-crawler", level="WARNING") as cm:
+                result = decode_google_news_url("https://news.google.com/rss/articles/xyz")
+        self.assertIsNone(result)
+        self.assertNotIn("None", cm.output[0])
+        self.assertIn("库未返回错误信息", cm.output[0])
+
 
 class TestRepositoryOpenidCompat(unittest.TestCase):
     """CloudBase 表 `_openid` 兼容：先带值写入，若报列不存在则自动去掉并记住该表。"""

@@ -43,13 +43,24 @@ def decode_google_news_url(
         logger.warning("解码异常（跳过该条）: %s | url=%s", exc, google_url[:80])
         return None
 
-    if isinstance(result, dict) and result.get("status"):
-        decoded = result.get("decoded_url")
-        if decoded:
-            return str(decoded)
-        logger.warning("解码返回空 URL: %s", google_url[:80])
-        return None
+    # ⚠️ googlenewsdecoder 各版本返回的成功键不同：新版用 "success"，
+    # 旧版用 "status"（见需求 11.9）。只认 "status" 会把新版**解码成功**的条目
+    # 误判为失败（且成功返回无 "message" 键 → 日志打出 None），导致整轮条目被
+    # 全部跳过。此处两者兼容：success 优先，缺失时回退 status。
+    if isinstance(result, dict):
+        success = result.get("success")
+        if success is None:
+            success = result.get("status")
+        if success:
+            decoded = result.get("decoded_url")
+            if decoded:
+                return str(decoded)
+            logger.warning("解码返回空 URL: %s", google_url[:80])
+            return None
 
-    message = result.get("message") if isinstance(result, dict) else "未知错误"
+    message = "未知错误"
+    if isinstance(result, dict):
+        # 失败但库未给 message 时用占位文案，避免日志打出 None 难以区分原因
+        message = result.get("message") or "（库未返回错误信息）"
     logger.warning("解码失败（跳过该条）: %s | url=%s", message, google_url[:80])
     return None
