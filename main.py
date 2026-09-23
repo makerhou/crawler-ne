@@ -59,6 +59,7 @@ def main() -> int:
                     None if args.dry_run else repo,
                     browser,
                     dry_run=args.dry_run,
+                    stop_event=stop_event,
                 )
             except Exception as exc:
                 # 单轮失败：清晰提示 + 非 0 退出码（便于脚本判断），不打 traceback

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import logging
 import re
+import threading
 import time
 import uuid
 from datetime import datetime
@@ -173,11 +174,13 @@ def run_once(
     repo: ArticleRepository | None = None,
     browser: BrowserFetcher | None = None,
     dry_run: bool = False,
+    stop_event: threading.Event | None = None,
 ) -> dict[str, int]:
     """执行一轮抓取，返回统计 {"added", "skipped", "failed"}。
 
     :param repo: 为 None 时不查重/不入库（诊断用）
     :param dry_run: 只打印挖掘结果，不写数据库（需配合 repo=None 或独立使用）
+    :param stop_event: 收到退出信号时立即中止当前轮次
     """
     started = time.time()
     stats = {"added": 0, "skipped": 0, "failed": 0}
@@ -204,6 +207,9 @@ def run_once(
     # 1) 解码 + 去重
     candidates: list[dict[str, Any]] = []
     for entry in entries:
+        if stop_event is not None and stop_event.is_set():
+            logger.info("收到停止信号，中止解码")
+            break
         real_url = decode_google_news_url(
             entry["google_url"],
             interval=config.decode_interval,
@@ -231,6 +237,9 @@ def run_once(
 
     # 2) 抓正文 + 入库
     for candidate in candidates:
+        if stop_event is not None and stop_event.is_set():
+            logger.info("收到停止信号，中止抓取")
+            break
         url = candidate["url"]
         try:
             detail = fetch_article_detail(
@@ -362,7 +371,7 @@ def run_forever(config: Config, repo: ArticleRepository, stop_event=None) -> Non
                 break
 
             try:
-                run_once(config, repo, browser)
+                run_once(config, repo, browser, stop_event=stop_event)
             except Exception as exc:
                 # 整轮失败：记录原因，等待下一轮（systemd 保证进程存活）
                 logger.exception("本轮执行失败: %s", exc)
