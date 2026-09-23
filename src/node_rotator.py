@@ -65,9 +65,12 @@ class NodeRotator:
         # 爬虫代理：仅用于「验证出口 IP」（出口由该代理提供）
         self.proxies = proxies or None
         # 访问面板默认直连（防自锁）；配置 NODE_PANEL_PROXY 时才走代理
-        self.panel_proxies: dict[str, str] | None = None
+        # ⚠️ 必须显式传 proxies dict，否则 requests 会自动读取 HTTPS_PROXY 环境变量，
+        #    导致面板请求也走爬虫代理（代理不通时面板也连不上 → 换 IP 彻底失效）
         if panel_proxy:
-            self.panel_proxies = {"http": panel_proxy, "https": panel_proxy}
+            self.panel_proxies: dict[str, str | None] = {"http": panel_proxy, "https": panel_proxy}
+        else:
+            self.panel_proxies = {"http": None, "https": None}
         self.timeout = timeout
         self.cache_ttl = cache_ttl
         self.wait_seconds = wait_seconds

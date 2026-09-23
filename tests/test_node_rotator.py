@@ -321,15 +321,20 @@ class TestPanelProxyIsolation(unittest.TestCase):
             session="s",
             proxies={"https": "http://127.0.0.1:7928"},
         )
+        # 未配置 NODE_PANEL_PROXY 时，必须显式传 {"http": None, "https": None}
+        # 而非 None —— 否则 requests 会自动读取 HTTPS_PROXY 环境变量，
+        # 导致面板请求也走爬虫代理（代理不通时面板也连不上）。
+        expected_direct = {"http": None, "https": None}
+
         with mock.patch("src.node_rotator.requests") as req:
             req.get.return_value = _Resp({"nodes": NODES})
             rot.fetch_nodes(force=True)
-            self.assertIsNone(req.get.call_args.kwargs.get("proxies"))
+            self.assertEqual(req.get.call_args.kwargs.get("proxies"), expected_direct)
 
         with mock.patch("src.node_rotator.requests") as req:
             req.post.return_value = _Resp({"ok": True})
             rot.connect("US_b")
-            self.assertIsNone(req.post.call_args.kwargs.get("proxies"))
+            self.assertEqual(req.post.call_args.kwargs.get("proxies"), expected_direct)
 
     def test_panel_proxy_can_be_overridden(self):
         rot = NodeRotator(

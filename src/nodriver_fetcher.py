@@ -182,24 +182,42 @@ class NodriverFetcher:
         return args
 
     async def _fetch_once(self, url: str, profile: dict[str, str]) -> str:
-        """用指定身份启动浏览器抓一次。"""
+        """用指定身份启动浏览器抓一次。
+
+        代理降级：若配置了代理但浏览器连接失败（代理没跑），自动去掉代理重试一次。
+        """
         import nodriver as uc
+
+        chrome_path = self._find_chrome()
+        browser_args = self._browser_args(profile)
 
         start_kwargs: dict = dict(
             headless=self.headless,
             # root 用户必须关沙箱，否则 Chromium 拒绝启动（报错 "Failed to connect to browser"）。
             # nodriver 0.50.x 参数名是 sandbox（默认 True）：
             #   sandbox=False → 内部添加 --no-sandbox → root 下才能启动
-            # 之前误写成 no_sandbox=True，被丢进 **kwargs 直接忽略，导致 root 下浏览器起不来。
             sandbox=False,
-            browser_args=self._browser_args(profile),
+            browser_args=browser_args,
         )
-        # 显式指定 Chrome 路径：nodriver 内部自动查找可能失败（尤其 Debian 上 chromium
-        # 装在 /usr/bin/chromium 但 nodriver 只找 google-chrome-stable）
-        chrome_path = self._find_chrome()
         if chrome_path:
             start_kwargs["browser_executable_path"] = chrome_path
-        browser = await uc.start(**start_kwargs)
+
+        try:
+            browser = await uc.start(**start_kwargs)
+        except Exception as exc:
+            # 代理不通是 "Failed to connect to browser" 的常见根因：
+            # Chrome 带 --proxy-server 启动后，若代理没跑，CDP 连接会超时。
+            # 降级：去掉代理参数重试一次（直连）。
+            has_proxy = any(a.startswith("--proxy-server=") for a in browser_args)
+            if not has_proxy:
+                raise
+            logger.warning(
+                "浏览器带代理启动失败（%s），降级为直连重试", exc
+            )
+            direct_args = [a for a in browser_args if not a.startswith("--proxy-server=")]
+            start_kwargs["browser_args"] = direct_args
+            browser = await uc.start(**start_kwargs)
+
         try:
             page = await browser.get(url)
             # 给挑战页 JS 执行与跳转的时间
