@@ -175,12 +175,14 @@ def run_once(
     browser: BrowserFetcher | None = None,
     dry_run: bool = False,
     stop_event: threading.Event | None = None,
+    nodriver: NodriverFetcher | None = None,
 ) -> dict[str, int]:
     """执行一轮抓取，返回统计 {"added", "skipped", "failed"}。
 
     :param repo: 为 None 时不查重/不入库（诊断用）
     :param dry_run: 只打印挖掘结果，不写数据库（需配合 repo=None 或独立使用）
     :param stop_event: 收到退出信号时立即中止当前轮次
+    :param nodriver: 外部传入时复用（持久化 event loop），为 None 时内部创建
     """
     started = time.time()
     stats = {"added": 0, "skipped": 0, "failed": 0}
@@ -194,7 +196,9 @@ def run_once(
 
     ua_pool = create_ua_pool(config)
     rotator = create_rotator(config)
-    nodriver = create_nodriver(config, ua_pool, rotator=rotator)
+    _nodriver_owned = nodriver is None
+    if _nodriver_owned:
+        nodriver = create_nodriver(config, ua_pool, rotator=rotator)
     entries = fetch_rss_entries(
         rss_url=config.rss_url,
         timeout=config.http_timeout,
@@ -319,6 +323,10 @@ def run_once(
         stats["added"] += 1
         logger.info("入库成功 id=%d title=%s", article_id, title[:60])
 
+    # 内部创建的 nodriver 需在本轮结束时关闭（外部传入的由调用方管理）
+    if _nodriver_owned and nodriver is not None:
+        nodriver.close()
+
     duration_ms = int((time.time() - started) * 1000)
     logger.info(
         "本轮完成：新增=%d 跳过=%d 失败=%d 耗时=%dms",
@@ -358,11 +366,15 @@ def create_browser(config: Config) -> BrowserFetcher | None:
 def run_forever(config: Config, repo: ArticleRepository, stop_event=None) -> None:
     """循环执行，直到 stop_event 被设置（用于 systemd 优雅退出）。
 
-    浏览器实例全程复用（每篇都启停会严重拖慢单轮耗时）。
+    浏览器 / nodriver 实例全程复用（每篇都启停会严重拖慢单轮耗时；
+    nodriver 的持久化 event loop 也必须跨轮次保持，否则内部状态冲突）。
     """
     logger.info("爬虫启动: %r | 抓取模式=%s", config, config.fetch_mode)
 
     browser = create_browser(config)
+    ua_pool = create_ua_pool(config)
+    rotator = create_rotator(config)
+    nodriver = create_nodriver(config, ua_pool, rotator=rotator)
 
     try:
         while True:
@@ -371,7 +383,7 @@ def run_forever(config: Config, repo: ArticleRepository, stop_event=None) -> Non
                 break
 
             try:
-                run_once(config, repo, browser, stop_event=stop_event)
+                run_once(config, repo, browser, stop_event=stop_event, nodriver=nodriver)
             except Exception as exc:
                 # 整轮失败：记录原因，等待下一轮（systemd 保证进程存活）
                 logger.exception("本轮执行失败: %s", exc)
@@ -391,5 +403,7 @@ def run_forever(config: Config, repo: ArticleRepository, stop_event=None) -> Non
             elif stop_event is None:
                 time.sleep(config.interval_seconds)
     finally:
+        if nodriver is not None:
+            nodriver.close()
         if browser is not None:
             browser.close()

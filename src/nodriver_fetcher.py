@@ -16,6 +16,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 import time
 from typing import TYPE_CHECKING
 
@@ -105,6 +106,16 @@ class NodriverFetcher:
         # 每次抓取后的冷却：实测密集请求会让 IP 被 DataDome 快速拉黑
         self.request_interval = max(0.0, request_interval)
         self._last_profile_name: str = ""
+
+        # 持久化 event loop：nodriver 内部维护全局 loop 状态，
+        # 反复 asyncio.run() 创建/销毁 loop 会导致第 2 次起报
+        # "Cannot run the event loop while another loop is running"。
+        # 解决方案：所有 nodriver 调用共用同一个 loop（跑在专用守护线程里）。
+        self._loop = asyncio.new_event_loop()
+        self._loop_thread = threading.Thread(
+            target=self._loop.run_forever, daemon=True, name="nodriver-loop"
+        )
+        self._loop_thread.start()
 
     @property
     def available(self) -> bool:
@@ -201,36 +212,34 @@ class NodriverFetcher:
                 logger.debug("关闭浏览器失败（忽略）: %s", exc)
 
     def _run_coroutine(self, coro_factory):
-        """在隔离环境中执行协程，彻底避开 event loop 冲突。
+        """在持久化 event loop 中执行协程，彻底避开 loop 冲突。
 
         ⚠️ 历史教训：
 
         1. 复用 ``uc.loop()`` 单例 loop：第 1 篇成功后 loop 被 nodriver 后台线程
            绑定，第 2 篇起报 ``Cannot run the event loop while another loop is running``。
-        2. 直接 ``asyncio.run()``：若主线程已有 running loop（如 Playwright sync_api
-           启动的内部 loop），同样报 ``asyncio.run() cannot be called from a running event loop``。
+        2. 直接 ``asyncio.run()``：每次创建/销毁 loop，nodriver 内部全局状态
+           指向已关闭的 loop，第 2 次起同样报错。
+        3. ``ThreadPoolExecutor`` + ``asyncio.run()``：新线程有新 loop，但 nodriver
+           内部仍可能引用旧 loop 的全局状态。
 
-        当前方案：
-        - 无 running loop → ``asyncio.run()``（最简路径）
-        - 有 running loop → ``ThreadPoolExecutor`` 在新线程中 ``asyncio.run()``
-          （每个线程有独立 event loop，互不干扰）
+        当前方案（v3）：
+        - __init__ 时创建**持久化 event loop** + 专用守护线程；
+        - 所有 nodriver 调用通过 ``run_coroutine_threadsafe`` 提交到该 loop；
+        - loop 永不关闭（直到进程退出），nodriver 内部状态始终一致。
 
         参数必须是「协程工厂」（每次调用返回新协程），而非协程对象。
         """
-        try:
-            loop = asyncio.get_running_loop()
-        except RuntimeError:
-            loop = None
+        future = asyncio.run_coroutine_threadsafe(coro_factory(), self._loop)
+        return future.result()
 
-        if loop is None:
-            # 主线程无 running loop → 直接 asyncio.run()
-            return asyncio.run(coro_factory())
-
-        # 已有 running loop → 在新线程中运行，避免冲突
-        import concurrent.futures
-        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:
-            future = executor.submit(asyncio.run, coro_factory())
-            return future.result()
+    def close(self) -> None:
+        """关闭持久化 event loop（进程退出前调用）。"""
+        if self._loop.is_running():
+            self._loop.call_soon_threadsafe(self._loop.stop)
+            self._loop_thread.join(timeout=5)
+        if not self._loop.is_closed():
+            self._loop.close()
 
     def _can_switch_ip(self, ip_switches: int) -> bool:
         """是否还能切换出口 IP（需已配置节点面板且未达次数上限）。"""
@@ -241,11 +250,12 @@ class NodriverFetcher:
         )
 
     def get_html(self, url: str) -> str | None:
-        """同步抓取；命中 DataDome 强特征则换出口 IP 重试，全部失败返回 None。
+        """同步抓取；命中 DataDome 强特征或浏览器连续异常则换出口 IP 重试，全部失败返回 None。
 
         重试策略（已确认）：
         - 命中 **DataDome 强特征**（var dd= / datadome / captcha-delivery）→ 换出口 IP
           重试：DataDome 封禁发生在 IP 层，换身份无效（已实测），最多换 max_ip_switch 次；
+        - **浏览器连续异常**（启动失败等）→ 也换出口 IP：代理不通/IP 被封是常见根因；
         - 其他拦截（挑战页、内容过小）→ 仅换身份重试，最多 max_switch 次；
         - 每换到一个新 IP，重新走一轮「换身份重试」。
         全部失败返回 None，由上层决定是否降级入库。
@@ -256,7 +266,9 @@ class NodriverFetcher:
         ip_switches = 0
         while True:
             # 在当前出口 IP 下换身份重试
-            datadome_hit = False
+            need_ip_switch = False
+            consecutive_errors = 0
+            switch_reason = ""
             for attempt in range(1, self.max_switch + 1):
                 profile = self.ua_pool.next_profile()
                 self._last_profile_name = profile["name"]
@@ -264,7 +276,9 @@ class NodriverFetcher:
                 try:
                     # 传工厂而非协程对象：重试时才能拿到全新协程
                     html = self._run_coroutine(lambda: self._fetch_once(url, profile))
+                    consecutive_errors = 0  # 成功拿到响应，重置连续异常计数
                 except Exception as exc:
+                    consecutive_errors += 1
                     logger.warning(
                         "nodriver 抓取异常（%d/%d，身份=%s）: %s",
                         attempt,
@@ -272,6 +286,16 @@ class NodriverFetcher:
                         profile["name"],
                         exc,
                     )
+                    # 所有尝试都是异常 → 很可能是代理/IP 层问题，触发换 IP
+                    if (
+                        consecutive_errors >= self.max_switch
+                        and self._can_switch_ip(ip_switches)
+                    ):
+                        need_ip_switch = True
+                        switch_reason = (
+                            f"浏览器连续 {consecutive_errors} 次异常（可能代理/IP 不通）"
+                        )
+                        break
                     continue
                 finally:
                     # 冷却：避免密集请求导致 IP 被 DataDome 拉黑
@@ -291,7 +315,8 @@ class NodriverFetcher:
                 # 仅「DataDome 强特征 + 确实能换 IP」时才中断换身份、改走换 IP；
                 # 未配置面板/次数用尽时继续换身份重试（保留原有兜底行为）
                 if is_datadome(html) and self._can_switch_ip(ip_switches):
-                    datadome_hit = True
+                    need_ip_switch = True
+                    switch_reason = "命中 DataDome"
                     break
 
                 logger.warning(
@@ -302,12 +327,13 @@ class NodriverFetcher:
                     len(html),
                 )
 
-            if not datadome_hit:
+            if not need_ip_switch:
                 break
 
             ip_switches += 1
             logger.warning(
-                "命中 DataDome → 第 %d/%d 次切换出口 IP 重试",
+                "%s → 第 %d/%d 次切换出口 IP 重试",
+                switch_reason,
                 ip_switches,
                 self.max_ip_switch,
             )
