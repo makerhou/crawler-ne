@@ -21,7 +21,7 @@ from .browser_fetcher import BrowserFetcher
 from .config import Config
 from .repository import ArticleRepository
 from .nodriver_fetcher import NodriverFetcher
-from .node_rotator import NodeRotator
+from .node_rotator import NodeRotator, proxy_exit_ip, wait_proxy_ready
 from .rss_fetcher import fetch_rss_entries
 from .url_decoder import decode_google_news_url
 from .user_agents import UserAgentPool
@@ -51,6 +51,7 @@ def create_rotator(config: Config) -> NodeRotator | None:
         panel_proxy=config.node_panel_proxy,
         precheck=config.node_precheck,
         max_candidates=config.max_node_candidates,
+        recover_timeout=config.proxy_recover_timeout,
     )
     if not rotator.enabled:
         logger.info(
@@ -186,6 +187,26 @@ def run_once(
     """
     started = time.time()
     stats = {"added": 0, "skipped": 0, "failed": 0}
+
+    # 0) 代理健康门禁：切换 VPN 节点会重启 OpenVPN，期间**整机代理流量瞬断**。
+    #    中断窗口内空跑 = 整轮全失败 + 向反爬风控输送异常请求，
+    #    因此开工前先探测代理，不可用则持续等待恢复；等不到就跳过本轮（下轮再试）。
+    if config.proxies:
+        exit_ip = proxy_exit_ip(config.proxies, timeout=10)
+        if not exit_ip:
+            logger.warning(
+                "轮前检查：代理不可用，最长等待 %ds 恢复…", config.proxy_wait_timeout
+            )
+            exit_ip = wait_proxy_ready(
+                config.proxies,
+                timeout=config.proxy_wait_timeout,
+                interval=10.0,
+                stop_event=stop_event,
+            )
+        if not exit_ip:
+            logger.error("代理未恢复，跳过本轮（等待下一轮重试）")
+            return stats
+        logger.info("轮前代理检查通过：出口 IP=%s", exit_ip)
 
     # dry-run 时每轮建独立目录，把完整文章落本地 JSON 便于核对（不入库）
     out_dir: Path | None = None

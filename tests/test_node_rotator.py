@@ -8,12 +8,13 @@ from __future__ import annotations
 
 import os
 import sys
+import threading
 import unittest
 from unittest import mock
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), ".."))
 
-from src.node_rotator import NodeRotator
+from src.node_rotator import NodeRotator, proxy_exit_ip, wait_proxy_ready
 
 # 节点样例：覆盖「住宅+干净」「住宅+被标代理」「移动」「未知」四类
 NODES = [
@@ -350,6 +351,82 @@ class TestPanelProxyIsolation(unittest.TestCase):
                 req.get.call_args.kwargs.get("proxies"),
                 {"http": "http://127.0.0.1:1087", "https": "http://127.0.0.1:1087"},
             )
+
+
+class TestProxyHealthHelpers(unittest.TestCase):
+    """模块级代理健康探测：proxy_exit_ip / wait_proxy_ready（需求 11.11）。"""
+
+    def test_exit_ip_success(self):
+        with mock.patch("src.node_rotator.requests") as req:
+            req.get.return_value = _Resp({"ip": "9.9.9.9"})
+            self.assertEqual(proxy_exit_ip({"https": "http://x"}), "9.9.9.9")
+
+    def test_exit_ip_failure_returns_none(self):
+        with mock.patch("src.node_rotator.requests") as req:
+            req.get.side_effect = RuntimeError("proxy down")
+            self.assertIsNone(proxy_exit_ip({"https": "http://x"}))
+
+    def test_wait_ready_returns_immediately_when_healthy(self):
+        with mock.patch(
+            "src.node_rotator.proxy_exit_ip", return_value="1.2.3.4"
+        ) as probe:
+            self.assertEqual(wait_proxy_ready({}, timeout=5, interval=0.01), "1.2.3.4")
+            self.assertEqual(probe.call_count, 1)
+
+    def test_wait_ready_polls_until_recovery(self):
+        """断网窗口内前几次探测失败，恢复后返回 IP（核心场景：切节点瞬断）。"""
+        with mock.patch(
+            "src.node_rotator.proxy_exit_ip", side_effect=[None, None, "1.2.3.4"]
+        ) as probe:
+            ip = wait_proxy_ready({}, timeout=30, interval=0.01)
+        self.assertEqual(ip, "1.2.3.4")
+        self.assertEqual(probe.call_count, 3)
+
+    def test_wait_ready_times_out(self):
+        with mock.patch("src.node_rotator.proxy_exit_ip", return_value=None):
+            self.assertIsNone(wait_proxy_ready({}, timeout=0.02, interval=0.01))
+
+    def test_wait_ready_aborts_on_stop_event(self):
+        ev = threading.Event()
+        ev.set()
+        with mock.patch("src.node_rotator.proxy_exit_ip", return_value=None):
+            self.assertIsNone(
+                wait_proxy_ready({}, timeout=60, interval=0.01, stop_event=ev)
+            )
+
+
+class TestSwitchWaitsRecovery(unittest.TestCase):
+    """switch() 在配置代理时，切换后持续轮询等待代理恢复（OpenVPN 重启瞬断）。"""
+
+    def setUp(self):
+        self.rot = NodeRotator(
+            panel_url="http://p/8787",
+            session="s",
+            wait_seconds=0,
+            proxies={"https": "http://127.0.0.1:7928"},
+            recover_timeout=30,
+        )
+        self.rot.fetch_nodes = mock.Mock(return_value=NODES)
+        self.rot.test_node = mock.Mock(return_value=True)
+
+    def test_waits_for_recovery_and_returns_new_ip(self):
+        with mock.patch.object(self.rot, "current_exit_ip", return_value="1.1.1.1"):
+            with mock.patch.object(self.rot, "connect", return_value=True):
+                with mock.patch(
+                    "src.node_rotator.wait_proxy_ready", return_value="2.2.2.2"
+                ) as waiter:
+                    self.assertEqual(self.rot.switch(), "2.2.2.2")
+        waiter.assert_called_once()
+
+    def test_recovery_timeout_tries_next_candidate(self):
+        """首个候选切换后代理迟迟未恢复 → 标记失效并尝试下一候选。"""
+        with mock.patch.object(self.rot, "current_exit_ip", return_value="1.1.1.1"):
+            with mock.patch.object(self.rot, "connect", return_value=True):
+                with mock.patch(
+                    "src.node_rotator.wait_proxy_ready",
+                    side_effect=[None, "3.3.3.3"],
+                ):
+                    self.assertEqual(self.rot.switch(), "3.3.3.3")
 
 
 if __name__ == "__main__":

@@ -33,6 +33,59 @@ logger = logging.getLogger("reuters-crawler")
 
 # 出口 IP 探测服务（返回 {"ip": "x.x.x.x"}）
 EXIT_IP_URL = "https://api.ipify.org?format=json"
+
+
+def proxy_exit_ip(proxies: dict[str, str] | None, timeout: float = 10.0) -> str | None:
+    """经指定代理探测出口 IP；失败返回 None（= 代理当前不可用）。
+
+    这是代理健康的**真值判定**：中继进程活着（7928 端口可连）不代表隧道能出网
+    —— OpenVPN 重连期间端口照常监听但转发全部失败，必须发起真实 HTTPS 请求验证。
+    """
+    try:
+        resp = requests.get(EXIT_IP_URL, timeout=timeout, proxies=proxies)
+        resp.raise_for_status()
+        return (resp.json() or {}).get("ip")
+    except Exception as exc:
+        logger.debug("出口 IP 探测失败: %s", exc)
+        return None
+
+
+def wait_proxy_ready(
+    proxies: dict[str, str] | None,
+    timeout: float = 180.0,
+    interval: float = 5.0,
+    stop_event: Any = None,
+) -> str | None:
+    """持续轮询直到代理恢复可用，返回出口 IP；超时返回 None。
+
+    为什么需要它：切换节点会重启 OpenVPN，期间**整机走代理的流量全部中断**
+    （实测瞬断可达数十秒）。中断窗口内让爬虫空跑 = 整轮全失败 + 向反爬风控
+    输送异常请求，因此必须等代理恢复后再继续。
+
+    :param stop_event: 可选 threading.Event；被 set 时提前中止等待（优雅退出）。
+    """
+    deadline = time.time() + timeout
+    attempt = 0
+    while True:
+        attempt += 1
+        ip = proxy_exit_ip(proxies)
+        if ip:
+            if attempt > 1:
+                logger.info("代理已恢复（第 %d 次探测）：出口 IP=%s", attempt, ip)
+            return ip
+        remaining = deadline - time.time()
+        if remaining <= 0:
+            logger.warning("持续探测 %.0fs（%d 次）后代理仍未恢复", timeout, attempt)
+            return None
+        if stop_event is not None and stop_event.is_set():
+            logger.info("收到停止信号，中止等待代理恢复")
+            return None
+        wait = min(interval, remaining)
+        logger.info("代理不可用（第 %d 次探测），%.0fs 后重试…", attempt, wait)
+        if stop_event is not None:
+            stop_event.wait(wait)  # 可被停止信号打断的 sleep
+        else:
+            time.sleep(wait)
 # 优选：住宅/移动 ASN
 PREFERRED_IP_TYPES = ("residential", "mobile")
 # 优选：未被反爬库标记为代理的节点（quality=normal）
@@ -53,8 +106,10 @@ class NodeRotator:
         panel_proxy: str = "",
         timeout: float = 15.0,
         cache_ttl: float = 300.0,
-        # OpenVPN 重连耗时（面板实测 ~4.6s），切换后需等待代理恢复稳定
+        # OpenVPN 重连耗时（面板实测 ~4.6s），切换后先固定等待再开始轮询
         wait_seconds: float = 5.0,
+        # 切换后持续探测代理恢复的最长秒数（重连期间整机代理流量中断）
+        recover_timeout: float = 90.0,
         # 切换前是否先用 test_node 预检节点可用（免费节点失效率高，强烈建议开启）
         precheck: bool = True,
         # 单次换 IP 最多试几个候选节点（每个 test_node ≈ 4.6s）
@@ -74,6 +129,7 @@ class NodeRotator:
         self.timeout = timeout
         self.cache_ttl = cache_ttl
         self.wait_seconds = wait_seconds
+        self.recover_timeout = recover_timeout
         self.precheck = precheck
         self.max_candidates = max(1, max_candidates)
         self._nodes: list[dict[str, Any]] | None = None
@@ -242,13 +298,16 @@ class NodeRotator:
     # ---------- 出口 IP ----------
     def current_exit_ip(self) -> str | None:
         """经爬虫代理探测当前出口 IP；探测失败（代理不可出网）返回 None。"""
-        try:
-            resp = requests.get(EXIT_IP_URL, timeout=self.timeout, proxies=self.proxies)
-            resp.raise_for_status()
-            return (resp.json() or {}).get("ip")
-        except Exception as exc:
-            logger.debug("探测出口 IP 失败: %s", exc)
-            return None
+        return proxy_exit_ip(self.proxies, self.timeout)
+
+    def wait_ready(self, timeout: float | None = None, stop_event: Any = None) -> str | None:
+        """持续探测直到爬虫代理恢复可用（详见模块级 wait_proxy_ready）。"""
+        return wait_proxy_ready(
+            self.proxies,
+            timeout=self.recover_timeout if timeout is None else timeout,
+            interval=3.0,
+            stop_event=stop_event,
+        )
 
     # ---------- 对外主入口 ----------
     def switch(self) -> str | None:
@@ -291,11 +350,20 @@ class NodeRotator:
                 self._failed_ids.add(node_id)
                 continue
 
-            # 等 OpenVPN 重连完成，代理恢复稳定后再验证
+            # 等 OpenVPN 重连完成：切换瞬间整机代理流量会瞬断，
+            # 固定等待后**持续轮询**直到代理恢复（最长 recover_timeout），
+            # 避免单次探测恰逢中断窗口而误判节点失败。
             time.sleep(self.wait_seconds)
-            new_ip = self.current_exit_ip()
+            if self.proxies:
+                new_ip = self.wait_ready()
+            else:
+                new_ip = self.current_exit_ip()
             if not new_ip:
-                logger.warning("切换 %s 后探测不到出口 IP → 换下一个候选", node_id)
+                logger.warning(
+                    "切换 %s 后代理在 %.0fs 内未恢复 → 换下一个候选",
+                    node_id,
+                    self.recover_timeout,
+                )
                 self._failed_ids.add(node_id)
                 continue
             if old_ip and new_ip == old_ip:

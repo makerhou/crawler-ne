@@ -138,6 +138,12 @@ class Config:
         # 单次换 IP 最多试几个候选节点（每个 test_node 约需 OpenVPN 连接 4.6s）
         self.max_node_candidates: int = _get_int("MAX_NODE_CANDIDATES", 5)
 
+        # ---------- 代理健康门禁（切节点会瞬断整机代理流量，等恢复再干活）----------
+        # 每轮开工前探测代理，不可用则持续等待恢复的最长秒数；超时跳过本轮
+        self.proxy_wait_timeout: int = _get_int("PROXY_WAIT_TIMEOUT", 300)
+        # 切换节点后等待代理恢复的最长秒数（rotator.switch 内部使用）
+        self.proxy_recover_timeout: int = _get_int("PROXY_RECOVER_TIMEOUT", 90)
+
         # UA 轮换：round_robin / random / off（off 则使用固定 USER_AGENT）
         self.ua_rotation: str = os.environ.get("UA_ROTATION", "round_robin").strip().lower()
         if self.ua_rotation not in {"round_robin", "random", "off"}:

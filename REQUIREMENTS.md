@@ -467,6 +467,33 @@ Google 2024 年后改了页面结构导致解析逻辑失效。
 **影响面**：仅 `src/url_decoder.py` 解码逻辑 + `requirements.txt` 版本约束。
 调度、抓取、入库、换 IP 等不受影响。
 
+### 11.11 代理健康门禁：切节点瞬断期间持续监控、等恢复再干活（2026-09-24，已实现）
+
+**背景**：切换 VPN 节点会重启 OpenVPN，期间**整机走代理的流量全部瞬断**（实测可达数十秒）。
+两个痛点：
+1. `run_once` 若在断网窗口内开工 → RSS/解码/抓取全部失败，还向 DataDome 输送异常请求加重封锁；
+2. 旧版 `switch()` 切换后固定 `sleep(5s)` 再**单次**探测出口 IP，恰逢中断窗口会把好节点误判为失效。
+
+另注意：中继端口（7928）可连 ≠ 隧道可用 —— OpenVPN 重连期间端口照常监听但转发全部失败，
+健康判定必须**经代理发起真实 HTTPS 请求**（探测 ipify 出口 IP）。
+
+**方案**：
+- `node_rotator` 新增模块级函数：
+  - `proxy_exit_ip(proxies, timeout)`：经代理探测出口 IP，失败返回 None（健康真值判定）；
+  - `wait_proxy_ready(proxies, timeout, interval, stop_event)`：持续轮询直到代理恢复，
+    支持 stop_event 提前中止（systemd 优雅退出）。
+- `run_once` **轮前门禁**：配置了代理时先探测；不可用则最长等待 `PROXY_WAIT_TIMEOUT`
+  （默认 300s）；仍未恢复 → 跳过本轮（下一轮自动重试），不空跑。
+- `switch()` **切换后轮询**：固定等待 `wait_seconds` 后，持续探测最长
+  `PROXY_RECOVER_TIMEOUT`（默认 90s）；未恢复才标记节点失效换下一候选。
+- 未配置代理（海外直连部署）时门禁完全跳过，行为与旧版一致。
+
+**附带规范（.env 引号约定）**：`USER_AGENT`/`RSS_URL` 等含空格、`&`、`()` 的值**必须加双引号**。
+Python 端解析器（`config.load_env_file`）无所谓，但 cron 常用的 bash `source .env`
+会语法报错（`syntax error near unexpected token '('`）导致整轮不执行。
+
+**影响面**：`src/node_rotator.py`、`src/scheduler.py`、`src/config.py`、`config.example.env`。
+
 ## 十二、LLM 分析微服务（2026-09-11 新增，2026-09-11 晚 迁移为 Go 实现）
 
 > **现状：分析服务已迁移为独立 Go 微服务 `llm-analysis-server`**，本目录（crawler）

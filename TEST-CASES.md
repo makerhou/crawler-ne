@@ -127,6 +127,25 @@ python -m unittest discover -s tests -t . -v
 - 库解码失败 → **HTTP 重定向 fallback** 取 `Location` 头（302 → 真实 URL）
 - 三级全部失败 → 日志打 `三级解码均失败`，返回 None
 
+### 1.8 代理健康门禁（2026-09-24 新增，对应需求 11.11）
+
+`tests/test_node_rotator.py`（探测与切换恢复，全 mock 离线）：
+
+- `proxy_exit_ip` 探测成功返回出口 IP / 失败返回 None
+- `wait_proxy_ready` 首次探测即健康 → 立即返回（只探测 1 次）
+- **前几次探测失败、恢复后返回 IP**（核心场景：切节点 OpenVPN 重启瞬断窗口）
+- 持续失败到超时 → 返回 None
+- stop_event 已置位 → 提前中止等待
+- `switch()`（配置了代理）：切换后经 `wait_proxy_ready` 轮询恢复并返回新 IP
+- `switch()`：首个候选恢复超时 → 标记失效并切换下一候选
+
+`tests/test_proxy_gate.py`（run_once 轮前门禁，全 mock 离线）：
+
+- **代理一直不可用 → 跳过本轮，绝不发起 RSS 抓取**
+- 初检失败但等待后恢复 → 正常开工
+- 初检通过 → 不进入等待轮询，直接开工
+- 未配置代理 → 不做任何探测（直连部署行为不变）
+
 ## 二、集成测试（需海外服务器 + 数据库凭据，待验证）
 
 > 本地（国内网络）`news.google.com` 不可达（`ConnectTimeout`），故以下用例需在海外服务器执行。
